@@ -485,21 +485,31 @@ local function refresh()
 			end
 			if state.stats.trainers > ds.trainers then
 				local n = state.stats.trainers - ds.trainers
-				ds.drinks = ds.drinks + n
 				ds.trainers = state.stats.trainers
-				-- still counts as a drink either way — this only decides
-				-- which banner wins. state.stage is still the PRE-defeat
-				-- next-unbeaten stage here (its own recompute runs later
-				-- below): if beating them just cleared exactly that
-				-- trainer's flag, this is a gym leader, and their own
-				-- "GYM BEATEN!" banner (fired below, once badges actually
-				-- increments — which can land a few ticks later, after the
-				-- badge-get dialogue closes) should be the only one shown,
-				-- not a redundant generic "TRAINER DOWN!" first.
-				local isGymLeader = state.stage and state.stage.key:match("^gym")
+				-- "Beat Gym/E4 = 1 Shot" REPLACES the generic "Beat a
+				-- Trainer = Drink" for that specific fight, it doesn't stack
+				-- with it — a gym/E4 boss is also a regular trainer (their
+				-- flag is part of this same trainers-beaten count), so
+				-- exclude exactly one of this tick's newly-beaten trainers
+				-- from the drink count when the currently-tracked stage
+				-- (state.stage — still the PRE-defeat value here; its own
+				-- recompute runs later below) is a gym/E4 stage and is now
+				-- confirmed beaten. Any OTHER trainers beaten in the same
+				-- tick still count normally.
+				local stageKey = state.stage and state.stage.key
+				local isBoss = stageKey and (stageKey:match("^gym") or stageKey:match("^e4"))
 					and gen3.isTrainerBeaten(game, state.stage.id)
-				if not isGymLeader then
+				local drinkCount = isBoss and (n - 1) or n
+				if drinkCount > 0 then
+					ds.drinks = ds.drinks + drinkCount
 					flash("TRAINER DOWN! DRINK!")
+				end
+				-- gym leaders get their shot from the badges-diff check
+				-- below (badges only increment for gyms) — E4 members grant
+				-- no badge, so their shot has to be added right here
+				if isBoss and stageKey:match("^e4") then
+					ds.shots = ds.shots + 1
+					flash("ELITE FOUR MEMBER DOWN! SHOT!")
 				end
 				state.dsDirty = true
 			end
