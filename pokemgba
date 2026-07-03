@@ -1,0 +1,6 @@
+#!/bin/sh
+# PokéParty mGBA launcher — one command, HUD included.
+# Usage: pokemgba [rom]   (no rom = mGBA opens its library as usual)
+MGBA="$HOME/mgba-master/build/qt/mgba-qt"
+HUD="$(dirname "$(readlink -f "$0")")/party-hud.lua"
+exec "$MGBA" --script "$HUD" "$@"
