@@ -502,16 +502,21 @@ end
 -- trainer identity alone. trainerId is fixed by the game engine (it's the
 -- same index used for the trainer-beaten flag, TRAINER_FLAGS_START+id) and
 -- is stable across randomizers for the same reason.
--- Struct layout (all Gen3 games, verified against pret/pokeemerald
--- include/data.h and cross-checked byte-for-byte against a real ROM):
+-- Struct layout (all Gen3 games, verified against pret/pokeemerald and
+-- pret/pokefirered include/data.h, cross-checked byte-for-byte against real
+-- ROMs — identical in both games):
 --   struct Trainer { u8 partyFlags; u8 class; u8 music_gender; u8 pic;
 --     u8 name[12]; u16 items[4]; bool8 doubleBattle; u32 aiFlags;
 --     u8 partySize; <pad> TrainerMonPtr party; } -- 40 bytes total
--- partyFlags selects the TrainerMon variant/stride: 0=6B (species+lvl only)
--- 1=14B (+moves) 2=8B (+item) 3=16B (+item+moves). lvl is byte+2, species
--- is u16+4 within each entry, in every variant.
+-- partyFlags selects the TrainerMon variant; lvl is byte+2, species is
+-- u16+4 within each entry, in every variant. STRIDE IS NOT THE STRUCT'S
+-- NATURAL SIZE: the compiler 4-byte-aligns array elements, so the 6-byte
+-- and 14-byte variants (flags 0/1) actually occupy 8 and 16 bytes each.
+-- This bit Emerald's own validation by luck — every Emerald boss happens to
+-- use flags=3 (16 bytes either way) — but broke FireRed's Brock outright
+-- (his 2nd party slot decoded as garbage: level 0) until corrected here.
 local TRAINER_STRUCT_SIZE = 40
-local PARTY_STRIDE = { [0] = 6, [1] = 14, [2] = 8, [3] = 16 }
+local PARTY_STRIDE = { [0] = 8, [1] = 16, [2] = 8, [3] = 16 }
 
 local function encodeName(name)
 	local out = {}
@@ -549,10 +554,26 @@ local function tryDecodeBossParty(structBase)
 end
 
 -- Ordered stage list per game. label is the short HUD tag. id is the
--- gTrainers[] index (== trainer-beaten flag bit, TRAINER_FLAGS_START+id),
--- taken from pret/pokeemerald include/constants/opponents.h and verified
--- against a real Emerald ROM (Roxanne's story team = Geodude/Geodude L12,
--- Nosepass L15, matching published data exactly).
+-- gTrainers[] index (== trainer-beaten flag bit, TRAINER_FLAGS_START+id).
+-- name must be the trainer's FULL internal name, not just a recognizable
+-- substring — "SURGE" alone never matches anything (his real name is
+-- "LT. SURGE" and the struct's name field starts at "LT.", not "SURGE");
+-- every entry below was read directly out of a real ROM to confirm both
+-- the id and the exact name, not assumed from memory.
+--
+-- BPEE (Emerald) verified against Roxanne's story team = Geodude/Geodude
+-- L12, Nosepass L15 (matches published data). Champion is Wallace.
+--
+-- BPRE/BPGE (FireRed/LeafGreen) verified against a real FireRed ROM, full
+-- level progression 14/21/24/29/43/43/47/50/54/56/58/60 — sane monotonic
+-- gym→E4 curve. No champion entry: FRLG's champion is the player's
+-- rival, whose stored trainer name is chosen per-save and can't be
+-- name-matched reliably. Giovanni needed the id-based path specifically:
+-- his name also appears on two much-weaker Team Rocket boss fights
+-- (Hideout/Silph Co, L20s-30s) that a plain "lowest level wins" name
+-- search picks by mistake over his real L50 gym battle.
+--
+-- AXVE/AXPE (Ruby/Sapphire): not yet verified against a real ROM.
 local STAGES = {
 	BPEE = {
 		{ key = "gym1", label = "G1", name = "ROXANNE", id = 265 },
@@ -569,9 +590,22 @@ local STAGES = {
 		{ key = "e4_4", label = "E4", name = "DRAKE", id = 264 },
 		{ key = "champ", label = "CH", name = "WALLACE", id = 335 },
 	},
-	-- BPRE/BPGE/AXVE/AXPE: not yet verified against a real ROM — trainer
-	-- IDs below are unconfirmed (from memory, not the header). See backlog.
+	BPRE = {
+		{ key = "gym1", label = "G1", name = "BROCK", id = 414 },
+		{ key = "gym2", label = "G2", name = "MISTY", id = 415 },
+		{ key = "gym3", label = "G3", name = "LT. SURGE", id = 416 },
+		{ key = "gym4", label = "G4", name = "ERIKA", id = 417 },
+		{ key = "gym5", label = "G5", name = "KOGA", id = 418 },
+		{ key = "gym6", label = "G6", name = "SABRINA", id = 420 },
+		{ key = "gym7", label = "G7", name = "BLAINE", id = 419 },
+		{ key = "gym8", label = "G8", name = "GIOVANNI", id = 350 },
+		{ key = "e4_1", label = "E1", name = "LORELEI", id = 410 },
+		{ key = "e4_2", label = "E2", name = "BRUNO", id = 411 },
+		{ key = "e4_3", label = "E3", name = "AGATHA", id = 412 },
+		{ key = "e4_4", label = "E4", name = "LANCE", id = 413 },
+	},
 }
+STAGES.BPGE = STAGES.BPRE -- LeafGreen shares FireRed's trainer table 1:1
 gen3.STAGES = STAGES
 
 function gen3.isTrainerBeaten(game, trainerId)
@@ -583,35 +617,16 @@ function gen3.isTrainerBeaten(game, trainerId)
 	return ok and byte and (byte & (1 << (f & 7))) ~= 0
 end
 
--- resolves (and caches, per ROM checksum) a single stage's boss max level.
--- Scans the full ROM for the boss's name — only run for the currently
--- relevant stage, not all of them, to keep this cheap.
-function gen3.locateStageBoss(game, stageKey, bucket)
-	game.bossCaps = game.bossCaps or {}
-	if game.bossCaps[stageKey] then return game.bossCaps[stageKey] end
-	local stages = STAGES[game.code]
-	if not stages then return nil end
-	local stage
-	for _, s in ipairs(stages) do
-		if s.key == stageKey then stage = s; break end
-	end
-	if not stage then return nil end
-
-	local cacheKey = "boss_" .. game.code .. "_" .. gen3.romIdent(game) .. "_" .. stageKey
-	local cachedLvl
-	pcall(function()
-		local v = bucket and bucket[cacheKey]
-		if type(v) == "number" then cachedLvl = v end
-	end)
-	if cachedLvl then
-		game.bossCaps[stageKey] = { id = stage.id, maxLevel = cachedLvl, label = stage.label }
-		return game.bossCaps[stageKey]
-	end
-
-	local pattern = encodeName(stage.name)
+-- full-ROM name scan, picking the WEAKEST matching encounter (assumes the
+-- lowest-level hit is the real story battle, not a rematch). This breaks
+-- down when a name has multiple unrelated encounters at wildly different
+-- points in the story (FireRed's Giovanni) — locateStageBoss only falls
+-- back to this after trying precise id-based addressing first.
+local function scanForBossByName(stageName)
+	local pattern = encodeName(stageName)
 	local CHUNK = 0x40000
 	local overlap = #pattern - 1
-	local bestLevel = nil
+	local bestLevel, bestBase = nil, nil
 	for base = 0, 0x00FFFFFF, CHUNK do
 		local ok, data = pcall(function()
 			return emu:readRange(0x08000000 + base, CHUNK + overlap)
@@ -624,17 +639,87 @@ function gen3.locateStageBoss(game, stageKey, bucket)
 		while true do
 			pos = data:find(pattern, pos + 1, true)
 			if not pos or pos > CHUNK then break end
-			-- the boss's own struct always has the weakest team (first
-			-- story encounter); rematch structs (higher level) sort after
-			local lvl = tryDecodeBossParty(base + pos - 1 - 4)
+			local structBase = base + pos - 1 - 4
+			local lvl = tryDecodeBossParty(structBase)
 			if lvl and (not bestLevel or lvl < bestLevel) then
-				bestLevel = lvl
+				bestLevel, bestBase = lvl, structBase
 			end
 		end
 	end
-	if not bestLevel then return nil end
-	if bucket then bucket[cacheKey] = bestLevel end
-	game.bossCaps[stageKey] = { id = stage.id, maxLevel = bestLevel, label = stage.label }
+	return bestBase, bestLevel
+end
+
+-- does the Trainer struct at structBase have exactly this name? Used to
+-- sanity-check a direct-addressed candidate before trusting it.
+local function verifyBossAt(structBase, expectedName)
+	local ok, raw = pcall(function() return emu:readRange(0x08000000 + structBase, 16) end)
+	if not ok or not raw or #raw < 16 then return false end
+	return gen3.decodeText(raw:sub(5, 16)) == expectedName
+end
+
+-- resolves (and caches, per ROM checksum) a single stage's boss max level.
+--
+-- Two strategies, in order:
+--  1. Direct gTrainers[] addressing from a cached table-start anchor
+--     (tableStart + id*40, verified by name match before trusting it).
+--     Exact — no ambiguity even when a name has multiple encounters.
+--  2. Full-ROM name scan picking the weakest match (only reached if no
+--     anchor exists yet, or the anchor's math doesn't check out for this
+--     particular id — e.g. a ROM hack reordered the table).
+-- The first successful resolution of ANY stage establishes the anchor for
+-- every stage after it, so in practice only one full-ROM scan ever runs
+-- per playthrough — the rest resolve instantly.
+function gen3.locateStageBoss(game, stageKey, bucket)
+	game.bossCaps = game.bossCaps or {}
+	if game.bossCaps[stageKey] then return game.bossCaps[stageKey] end
+	local stages = STAGES[game.code]
+	if not stages then return nil end
+	local stage
+	for _, s in ipairs(stages) do
+		if s.key == stageKey then stage = s; break end
+	end
+	if not stage then return nil end
+
+	local cacheKey = "boss2_" .. game.code .. "_" .. gen3.romIdent(game) .. "_" .. stageKey
+	local cachedLvl
+	pcall(function()
+		local v = bucket and bucket[cacheKey]
+		if type(v) == "number" then cachedLvl = v end
+	end)
+	if cachedLvl then
+		game.bossCaps[stageKey] = { id = stage.id, maxLevel = cachedLvl, label = stage.label }
+		return game.bossCaps[stageKey]
+	end
+
+	local level = nil
+	local anchorKey = "tblstart_" .. game.code .. "_" .. gen3.romIdent(game)
+	local tableStart
+	pcall(function()
+		local v = bucket and bucket[anchorKey]
+		if type(v) == "number" then tableStart = v end
+	end)
+	if not tableStart then
+		local anchorBase, anchorLevel = scanForBossByName(stage.name)
+		if anchorBase then
+			tableStart = anchorBase - stage.id * 40
+			if bucket then bucket[anchorKey] = tableStart end
+			level = anchorLevel -- already decoded this exact stage while anchoring
+		end
+	end
+	if not level and tableStart then
+		local candidateBase = tableStart + stage.id * 40
+		if verifyBossAt(candidateBase, stage.name) then
+			level = tryDecodeBossParty(candidateBase)
+		end
+	end
+	if not level then
+		local _, lvl = scanForBossByName(stage.name)
+		level = lvl
+	end
+
+	if not level then return nil end
+	if bucket then bucket[cacheKey] = level end
+	game.bossCaps[stageKey] = { id = stage.id, maxLevel = level, label = stage.label }
 	return game.bossCaps[stageKey]
 end
 

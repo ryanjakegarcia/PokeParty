@@ -11,6 +11,9 @@
 --   wheel.active               -- true while visible
 
 local wheel = { active = false }
+-- callers may override this (e.g. party-hud.lua points it at its own
+-- log() so wheel messages also land in POKEPARTY_DEBUG's log file)
+wheel.log = function(msg) console:log("PokéParty: " .. msg) end
 
 -- edit freely: label lines, wedge color, and optional counter effects.
 -- `catch` is EXTRA charges granted on top of the normal nuzlocke 1-per-route
@@ -18,7 +21,7 @@ local wheel = { active = false }
 -- multiplier, party-hud.lua adds it directly to state.ds.extraCatch.
 wheel.SEGMENTS = {
 	{ label = "SHOT!",          color = 0xFFE5484D, shots  = 1 },
-	{ label = "REVIVE!", 		color = 0xFF41C463 },
+	{ label = "REVIVE!", 		color = 0xFF41C463, revive = 1 },
 	{ label = "DRINK\nx2",      color = 0xFFF5C542, drinks = 2 },
 	{ label = "+2 LVL\nCAP",    color = 0xFF6890F0, cap    = 2 },
 	{ label = "x2 CATCH", 		color = 0xFFF08030, catch  = 1 },
@@ -36,9 +39,27 @@ local state = {
 	vel = 0,
 	phase = "idle",         -- idle | spinning | showing
 	result = nil,
-	holdUntil = 0,
-	frame = 0,
+	holdUntil = 0,          -- os.time()-based; result banner display duration
+	frame = 0,              -- draw-throttle counter only, NOT used for timing
+	-- tick() is driven by the "frame" callback = once per EMULATED frame,
+	-- which runs 2-4x faster than real time under fast-forward. mGBA's Lua
+	-- sandbox has no sub-second wall clock (os.clock() is CPU time, drifts
+	-- when the process idles between frames — see party-hud.lua's flash
+	-- timing fix; os.time() is real but only 1-second resolution, too
+	-- coarse for smooth spin physics). So: self-calibrate by measuring how
+	-- many ticks actually land within each real second, then scale the
+	-- per-tick decay so the TOTAL decay applied per real second stays
+	-- constant regardless of how many ticks that took — the spin settles
+	-- in ~the same real-world time at 1x or 4x speed.
+	tickSecMark = os.time(),
+	ticksThisSec = 0,
+	measuredRate = 60, -- ticks/sec, updated continuously; 60 = 1x default
 }
+-- decay tuned at the original 60-ticks/sec baseline (0.985/tick), expressed
+-- as "how much velocity survives after one real second" (≈0.404) —
+-- reapplied at whatever rate ticks actually happen at, so total decay per
+-- real second stays constant regardless of tick rate.
+local DECAY_PER_SECOND = 0.985 ^ 60
 
 local function px(v) return math.floor(v * S) end
 
@@ -166,6 +187,7 @@ function wheel.spin()
 	if not state.disc then
 		state.disc = prerenderDisc()
 	end
+	wheel.log(string.format("wheel spin start, measured rate %d ticks/sec", state.measuredRate))
 	state.phase = "spinning"
 	wheel.active = true
 	state.angle = math.random() * 2 * math.pi
@@ -175,22 +197,43 @@ end
 
 -- call every frame; returns the landed segment table exactly once
 function wheel.tick()
-	if not state.layer or state.phase == "idle" then return nil end
+	if not state.layer then return nil end
+
+	-- self-calibrate ticks/real-second continuously, even while idle — NOT
+	-- gated behind "only while spinning". Measuring only during a spin is a
+	-- chicken-and-egg problem: on the first spin of a session the rate is
+	-- still the stale 60 default, which (if the true rate is much higher,
+	-- e.g. under fast-forward) makes the decay wildly too aggressive, so
+	-- the spin resolves in a fraction of a second — before a full real
+	-- second ever elapses to correct the measurement. Calibrating
+	-- continuously means the rate is already accurate the moment a spin
+	-- starts, whenever that happens to be.
+	state.ticksThisSec = state.ticksThisSec + 1
+	local now = os.time()
+	if now ~= state.tickSecMark then
+		state.measuredRate = math.max(1, state.ticksThisSec)
+		state.ticksThisSec = 0
+		state.tickSecMark = now
+	end
+
+	if state.phase == "idle" then return nil end
 	state.frame = state.frame + 1
+
 	if state.phase == "spinning" then
 		state.angle = (state.angle + state.vel) % (2 * math.pi)
-		state.vel = state.vel * 0.985
+		local perTickDecay = DECAY_PER_SECOND ^ (1 / state.measuredRate)
+		state.vel = state.vel * perTickDecay
 		if state.frame % 2 == 0 then draw() end
 		if state.vel < 0.006 then
 			local n = #wheel.SEGMENTS
 			state.result = (math.floor(state.angle / (2 * math.pi) * n) % n) + 1
 			state.phase = "showing"
-			state.holdUntil = state.frame + 300 -- ~5s
+			state.holdUntil = os.time() + 5
 			draw()
 			return wheel.SEGMENTS[state.result]
 		end
 	elseif state.phase == "showing" then
-		if state.frame >= state.holdUntil then
+		if os.time() >= state.holdUntil then
 			state.phase = "idle"
 			wheel.active = false
 			clearLayer()

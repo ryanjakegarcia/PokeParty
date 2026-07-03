@@ -41,6 +41,7 @@ local function log(msg)
 		end
 	end
 end
+wheel.log = log -- route wheel.lua's own log lines through the same file
 
 -- Canvas coordinates are GBA screen pixels (240x160); the canvas grows to
 -- fit layers, and mGBA scales the whole canvas to the window. The side
@@ -66,10 +67,18 @@ local S = HUD_SCALE
 local STRIP_H = math.max(0, tonumber(os.getenv("POKEPARTY_STRIP_H") or "24"))
 local STRIP_W = 240 + PANEL_W -- full combined width (game + side panel)
 
--- how long a flash/event banner holds before fading, in emulated frames
--- (60/s). Longer than a quick solo-play glance needs — this is read by a
--- room full of people over HDMI, not just the player at the keyboard.
-local FLASH_HOLD_FRAMES = 270
+-- how long a flash/event banner holds before fading, in real (wall-clock)
+-- seconds — deliberately NOT emulated frames, which run 2-4x faster than
+-- real time under fast-forward and would make popups blip past too quick
+-- for anyone to read. Uses os.time(), NOT os.clock(): os.clock() measures
+-- CPU time (time actually spent executing), which runs slower than real
+-- time whenever the process idles between frames — made popups hang around
+-- LONGER than intended, the opposite bug. os.time() has only whole-second
+-- resolution but is genuine wall-clock, correct regardless of CPU load or
+-- emulation speed. Longer than a quick solo-play glance needs — this is
+-- read by a room full of people over HDMI, not just the player at the
+-- keyboard.
+local FLASH_HOLD_SECONDS = 5
 
 -- alignment constants (mgba-util/image.h)
 local TL = 0x11 -- top|left
@@ -117,6 +126,7 @@ local state = {
 	party = {},
 	stats = nil,
 	prevHP = {},      -- "personality_otId" -> hp
+	prevSpecies = {}, -- "personality_otId" -> species, for evolution detection
 	lastSig = nil,    -- redraw only when content changes
 }
 
@@ -152,7 +162,7 @@ local function cloneDS(ds)
 		drinks = ds.drinks, shots = ds.shots,
 		levelCapDelta = ds.levelCapDelta, extraCatch = ds.extraCatch,
 		caught = ds.caught, trainers = ds.trainers, badges = ds.badges,
-		faints = ds.faints, important = ds.important,
+		faints = ds.faints, revives = ds.revives, important = ds.important,
 	}
 end
 
@@ -177,9 +187,9 @@ local function commitDS()
 	bucket[state.dsKey] = state.ds
 	state.dsCommitted = cloneDS(state.ds)
 	state.dsDirty = false
-	log(string.format("counters committed: D:%d S:%d cap+%d catch+%d FNT:%d",
+	log(string.format("counters committed: D:%d S:%d cap+%d catch+%d FNT:%d REV:%d",
 		state.ds.drinks, state.ds.shots, state.ds.levelCapDelta,
-		state.ds.extraCatch, state.ds.faints))
+		state.ds.extraCatch, state.ds.faints, state.ds.revives))
 end
 
 -- loads the unified per-save blob, migrating the old three-key scheme
@@ -194,7 +204,8 @@ local function loadOrMigrateDS(game, tid)
 				drinks = v.drinks, shots = v.shots or 0,
 				levelCapDelta = v.levelCapDelta or 0, extraCatch = v.extraCatch or 0,
 				caught = v.caught or 0, trainers = v.trainers or 0, badges = v.badges or 0,
-				faints = v.faints or 0, important = v.important or "",
+				faints = v.faints or 0, revives = v.revives or 0,
+				important = v.important or "",
 			}
 		end
 	end)
@@ -209,7 +220,7 @@ local function loadOrMigrateDS(game, tid)
 				levelCapDelta = v.levelCapDelta or 0, extraCatch = v.extraCatch or 0,
 				caught = v.caught or 0, trainers = v.trainers or 0, badges = v.badges or 0,
 				faints = tonumber(bucket["faints_" .. game.code .. "_" .. tid]) or 0,
-				important = "",
+				revives = 0, important = "",
 			}
 			local iv = bucket["imp_" .. game.code .. "_" .. tid]
 			if type(iv) == "string" then migrated.important = iv end
@@ -233,6 +244,8 @@ local function detectGame()
 	state.party = {}
 	state.stats = nil
 	state.prevHP = {}
+	state.prevSpecies = {}
+	state.rawStable = nil -- {tid,caught,trainers,badges}, for the 2-tick stability gate
 	state.lastSig = nil
 	state.ptrScanTick = nil
 	state.flash = nil
@@ -256,7 +269,7 @@ local function detectGame()
 end
 
 local function flash(msg)
-	state.flash = { text = msg, expires = state.frame + FLASH_HOLD_FRAMES }
+	state.flash = { text = msg, expiresAt = os.time() + FLASH_HOLD_SECONDS }
 	state.lastSig = nil -- force redraw
 end
 
@@ -300,6 +313,33 @@ local function trackFaints()
 	end
 end
 
+-- Gen3 marks a species "owned" in the Pokédex on EVOLUTION too, not just on
+-- catching one — the dex-owned popcount we use to detect catches can't
+-- natively tell the two apart (this isn't a bug in our reading: the games'
+-- own Trainer Card "caught" stat is computed the exact same way and has
+-- the identical quirk). Evolution keeps the same individual (personality+
+-- otId unchanged, only species changes); a real catch always introduces a
+-- personality+otId never seen before. Counting species changes on already-
+-- known party members each tick lets the catch-diff below subtract out
+-- exactly the dex-bump evolution caused, leaving only real catches.
+local function countEvolutions()
+	local n = 0
+	local seen = {}
+	for _, mon in ipairs(state.party) do
+		local key = mon.personality .. "_" .. mon.otId
+		seen[key] = true
+		local prevSpecies = state.prevSpecies[key]
+		if prevSpecies and prevSpecies ~= mon.species then
+			n = n + 1
+		end
+		state.prevSpecies[key] = mon.species
+	end
+	for key in pairs(state.prevSpecies) do
+		if not seen[key] then state.prevSpecies[key] = nil end
+	end
+	return n
+end
+
 local function refresh()
 	local game = state.game
 	if not game then return end
@@ -320,6 +360,10 @@ local function refresh()
 		end
 	end
 	state.party = gen3.readParty(game)
+	-- must run every refresh (not gated behind saveReady) so prevSpecies
+	-- stays in sync and the first tick after a save loads doesn't get
+	-- misread as a pile of simultaneous "evolutions"
+	local evolutions = countEvolutions()
 	state.stats = gen3.readTrainerStats(game)
 	-- rebuilt hacks move the SaveBlock pointers: party reads fine but stats
 	-- don't. Locate the pointers by matching the party's OT id in IWRAM.
@@ -332,9 +376,33 @@ local function refresh()
 	end
 	-- During boot/intro the save block is zeroed (tid 0, all counters 0);
 	-- initializing or diffing against that phantom state fires bogus events
-	-- when the real save loads. Only track once a real save (tid != 0) is
-	-- up, and re-key everything if the user switches saves mid-session.
-	local saveReady = state.stats and state.stats.tid ~= 0
+	-- when the real save loads. Only track once a real save (tid != 0) is up.
+	--
+	-- FireRed/LeafGreen additionally play a "recap" narration right after
+	-- Continue, which transiently misreads caught/trainers/badges (some
+	-- scratch buffer or repointing happening to generate the narration
+	-- text, before settling on the real save) — observed live: baseline
+	-- correctly set at D:10, then jumped to D:14 with zero real gameplay
+	-- during the recap. Guard against ANY such transient blip generically:
+	-- don't trust a stats snapshot for baselining or diffing until the
+	-- exact same values have been read on two consecutive ticks. Costs one
+	-- tick (~0.3s) of latency on a genuine change; filters single-tick
+	-- blips entirely regardless of what causes them.
+	local statsStable = false
+	if state.stats then
+		local r = state.rawStable
+		if r and r.tid == state.stats.tid and r.caught == state.stats.caught
+			and r.trainers == state.stats.trainers and r.badges == state.stats.badges then
+			statsStable = true
+		else
+			state.rawStable = {
+				tid = state.stats.tid, caught = state.stats.caught,
+				trainers = state.stats.trainers, badges = state.stats.badges,
+			}
+		end
+	end
+	-- re-key everything if the user switches saves mid-session
+	local saveReady = state.stats and state.stats.tid ~= 0 and statsStable
 	if saveReady and state.dsTid ~= state.stats.tid then
 		state.dsTid = state.stats.tid
 		local loaded, key, isFresh = loadOrMigrateDS(game, state.stats.tid)
@@ -346,16 +414,16 @@ local function refresh()
 			state.ds = {
 				drinks = 0, shots = 0, levelCapDelta = 0, extraCatch = 0,
 				caught = state.stats.caught, trainers = state.stats.trainers,
-				badges = state.stats.badges, faints = 0, important = "",
+				badges = state.stats.badges, faints = 0, revives = 0, important = "",
 			}
 		end
 		state.importantSet = parseImportant(state.ds.important)
 		state.dsCommitted = cloneDS(state.ds)
 		state.dsDirty = false
 		state.dsWasRegressed = false
-		log(string.format("counters ready: D:%d S:%d cap+%d catch+%d FNT:%d",
+		log(string.format("counters ready: D:%d S:%d cap+%d catch+%d FNT:%d REV:%d",
 			state.ds.drinks, state.ds.shots, state.ds.levelCapDelta,
-			state.ds.extraCatch, state.ds.faints))
+			state.ds.extraCatch, state.ds.faints, state.ds.revives))
 	end
 	-- event detection by diffing save counters
 	if saveReady and state.ds then
@@ -388,26 +456,51 @@ local function refresh()
 			state.dsWasRegressed = false
 			if state.stats.caught > ds.caught then
 				local n = state.stats.caught - ds.caught
-				ds.drinks = ds.drinks + n
 				ds.caught = state.stats.caught
-				-- x2 catch: bonus is consumed by the very next catch(es) after
-				-- it was granted, regardless of which route it happens on (no
-				-- reliable way to bind it to a specific route from save data —
-				-- self-enforced by the player, same as the base 1-per-route rule)
-				if ds.extraCatch > 0 then
-					local used = math.min(n, ds.extraCatch)
-					ds.extraCatch = ds.extraCatch - used
-					flash("CAUGHT! DRINK! (x2 catch used)")
-				else
-					flash("CAUGHT! DRINK!")
-				end
+				-- baseline moved even if it turns out to be pure evolution
+				-- (below) — mark dirty now so it still reaches disk on the
+				-- next real save, instead of silently drifting from the
+				-- committed snapshot until some other event happens to
+				-- trigger a commit
 				state.dsDirty = true
+				-- evolution also marks the evolved species "owned" — subtract
+				-- out however many of this tick's dex-owned bumps came from
+				-- evolutions, not real catches (see countEvolutions above)
+				local realCatches = math.max(0, n - evolutions)
+				if realCatches > 0 then
+					ds.drinks = ds.drinks + realCatches
+					-- x2 catch: bonus is consumed by the very next catch(es)
+					-- after it was granted, regardless of which route it
+					-- happens on (no reliable way to bind it to a specific
+					-- route from save data — self-enforced by the player,
+					-- same as the base 1-per-route rule)
+					if ds.extraCatch > 0 then
+						local used = math.min(realCatches, ds.extraCatch)
+						ds.extraCatch = ds.extraCatch - used
+						flash("CAUGHT! DRINK! (x2 catch used)")
+					else
+						flash("CAUGHT! DRINK!")
+					end
+				end
 			end
 			if state.stats.trainers > ds.trainers then
 				local n = state.stats.trainers - ds.trainers
 				ds.drinks = ds.drinks + n
 				ds.trainers = state.stats.trainers
-				flash("TRAINER DOWN! DRINK!")
+				-- still counts as a drink either way — this only decides
+				-- which banner wins. state.stage is still the PRE-defeat
+				-- next-unbeaten stage here (its own recompute runs later
+				-- below): if beating them just cleared exactly that
+				-- trainer's flag, this is a gym leader, and their own
+				-- "GYM BEATEN!" banner (fired below, once badges actually
+				-- increments — which can land a few ticks later, after the
+				-- badge-get dialogue closes) should be the only one shown,
+				-- not a redundant generic "TRAINER DOWN!" first.
+				local isGymLeader = state.stage and state.stage.key:match("^gym")
+					and gen3.isTrainerBeaten(game, state.stage.id)
+				if not isGymLeader then
+					flash("TRAINER DOWN! DRINK!")
+				end
 				state.dsDirty = true
 			end
 			if state.stats.badges > ds.badges then
@@ -554,7 +647,7 @@ local function drawTopStrip()
 	local p = image.newPainter(state.topLayer.image)
 	p:loadFont(FONT_PATH)
 	p:setBlend(false)
-	local active = state.flash and state.flash.expires > state.frame
+	local active = state.flash and state.flash.expiresAt > os.time()
 	local bg = C.bg
 	if active then
 		bg = state.dsWasRegressed and C.warnBg or C.accent
@@ -587,22 +680,46 @@ local function drawBottomStrip()
 		return
 	end
 	local midY = STRIP_H // 2
+
+	-- left and right zones are drawn first and MEASURED (textBoxSize is
+	-- FreeType 26.6 fixed-point: px × 64, see mgba-lua-api-gotchas), so the
+	-- center zone can be constrained to whatever gap is actually left
+	-- between them — fixed pixel anchors overlapped once the right zone's
+	-- content grew (x2-catch suffix pushed its left edge into the center
+	-- text's territory)
 	local capText = "CAP --"
 	if state.stage then
 		local delta = (state.ds and state.ds.levelCapDelta) or 0
 		capText = string.format("CAP %d %s", state.stage.maxLevel + delta, state.stage.label)
 	end
 	text(p, capText, 10, midY, 11, C.dim, VL)
-	if state.ds then
-		text(p, string.format("D:%d   S:%d", state.ds.drinks, state.ds.shots),
-			STRIP_W // 2, midY, 13, C.accent, VC)
-	end
+	p:setFontSize(11 * S)
+	local leftEdge = 10 + p:textBoxSize(capText).width // (64 * S)
+
 	local rightText = "FNT " .. ((state.ds and state.ds.faints) or 0)
 	if state.ds and state.ds.extraCatch > 0 then
 		rightText = rightText .. "   ×2 CATCH"
 		if state.ds.extraCatch > 1 then rightText = rightText .. " x" .. state.ds.extraCatch end
 	end
 	text(p, rightText, STRIP_W - 10, midY, 11, C.dim, VR)
+	p:setFontSize(11 * S)
+	local rightEdge = STRIP_W - 10 - p:textBoxSize(rightText).width // (64 * S)
+
+	if state.ds then
+		local centerText = string.format("D:%d   S:%d   R:%d", state.ds.drinks, state.ds.shots, state.ds.revives)
+		local gap = math.max(0, rightEdge - leftEdge)
+		-- shrink from 13 down to 9 if the natural size wouldn't fit the
+		-- available gap; below 9 just let it clip rather than go illegible
+		local size = 13
+		p:setFontSize(size * S)
+		local w = p:textBoxSize(centerText).width // (64 * S)
+		while w > gap - 12 and size > 9 do
+			size = size - 1
+			p:setFontSize(size * S)
+			w = p:textBoxSize(centerText).width // (64 * S)
+		end
+		text(p, centerText, (leftEdge + rightEdge) // 2, midY, size, C.accent, VC)
+	end
 	state.bottomLayer:update()
 	canvas:update()
 	if DEBUG_LOG then state.bottomLayer.image:save(DEBUG_LOG .. "/strip_bottom.png", "PNG") end
@@ -688,7 +805,7 @@ local function giveCandies()
 end
 
 local function flashActive()
-	return state.flash and state.flash.expires > state.frame
+	return state.flash and state.flash.expiresAt > os.time()
 end
 
 -- signature of displayed data; redraw only on change
@@ -700,6 +817,7 @@ local function signature()
 		parts[#parts + 1] = state.ds.levelCapDelta
 		parts[#parts + 1] = state.ds.extraCatch
 		parts[#parts + 1] = state.ds.faints
+		parts[#parts + 1] = state.ds.revives
 	end
 	if state.stage then
 		parts[#parts + 1] = state.stage.label
@@ -768,6 +886,9 @@ local function onFrame()
 			if seg.catch then
 				state.ds.extraCatch = state.ds.extraCatch + seg.catch
 				msg = msg .. string.format(" (+%d catch)", seg.catch)
+			end
+			if seg.revive then
+				state.ds.revives = state.ds.revives + seg.revive
 			end
 			state.dsDirty = true
 		end
