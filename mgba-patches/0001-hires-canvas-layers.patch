@@ -1,0 +1,119 @@
+diff --git a/src/script/canvas.c b/src/script/canvas.c
+index 0a0ce5b..8d4be1c 100644
+--- a/src/script/canvas.c
++++ b/src/script/canvas.c
+@@ -17,6 +17,7 @@ struct mScriptCanvasLayer {
+ 	int x;
+ 	int y;
+ 	unsigned scale;
++	unsigned upscale;
+ 	bool dirty;
+ 	bool sizeDirty;
+ 	bool dimsDirty;
+@@ -36,6 +37,7 @@ mSCRIPT_DECLARE_STRUCT(mScriptCanvasLayer);
+ 
+ static void mScriptCanvasLayerDestroy(struct mScriptCanvasLayer* layer);
+ static void mScriptCanvasLayerUpdate(struct mScriptCanvasLayer* layer);
++static void _mScriptCanvasUpdate(struct mScriptCanvasContext* canvas);
+ 
+ static int _getNextAvailableOverlay(struct mScriptCanvasContext* context) {
+ 	if (!context->backend) {
+@@ -92,7 +94,11 @@ void mScriptCanvasSetInternalScale(struct mScriptContext* context, unsigned scal
+ 	size_t i;
+ 	for (i = 0; i < VIDEO_LAYER_OVERLAY_COUNT; ++i) {
+ 		canvas->overlays[i].scale = scale;
++		// reflow layers whose dimensions were already pushed at an old scale
++		canvas->overlays[i].dirty = true;
++		canvas->overlays[i].dimsDirty = true;
+ 	}
++	_mScriptCanvasUpdate(canvas);
+ }
+ 
+ static void _mScriptCanvasUpdate(struct mScriptCanvasContext* canvas) {
+@@ -147,10 +153,16 @@ void mScriptCanvasUpdate(struct mScriptContext* context) {
+ 	_mScriptCanvasUpdate(canvas);
+ }
+ 
+-static struct mScriptValue* mScriptCanvasLayerCreate(struct mScriptCanvasContext* context, int w, int h) {
++static struct mScriptValue* mScriptCanvasLayerCreate(struct mScriptCanvasContext* context, int w, int h, int upscale) {
+ 	if (w <= 0 || h <= 0) {
+ 		return NULL;
+ 	}
++	if (upscale < 1) {
++		upscale = 1;
++	}
++	if (upscale > 8) {
++		upscale = 8;
++	}
+ 	int next = _getNextAvailableOverlay(context);
+ 	if (next < 0) {
+ 		return NULL;
+@@ -160,12 +172,16 @@ static struct mScriptValue* mScriptCanvasLayerCreate(struct mScriptCanvasContext
+ 	// This shouldn't exist yet
+ 	mASSERT(!layer->image);
+ 
+-	layer->image = mImageCreate(w, h, mCOLOR_ABGR8);
++	// The backing image is created upscale× larger than the layer's logical
++	// size, letting scripts draw high-resolution overlays; backends sample
++	// the full image into the logical-size layer rectangle
++	layer->image = mImageCreate(w * upscale, h * upscale, mCOLOR_ABGR8);
+ 	layer->dirty = true;
+ 	layer->dimsDirty = true;
+ 	layer->sizeDirty = true;
+ 	layer->contentsDirty = true;
+ 	layer->scale = context->scale;
++	layer->upscale = upscale;
+ 	mScriptCanvasLayerUpdate(layer);
+ 
+ 	struct mScriptValue* value = mScriptValueAlloc(mSCRIPT_TYPE_MS_S(mScriptCanvasLayer));
+@@ -196,11 +212,12 @@ static void mScriptCanvasLayerUpdate(struct mScriptCanvasLayer* layer) {
+ 		layer->contentsDirty = true;
+ 	}
+ 	if (layer->dimsDirty) {
++		unsigned upscale = layer->upscale ? layer->upscale : 1;
+ 		struct mRectangle frame = {
+ 			.x = layer->x * layer->scale,
+ 			.y = layer->y * layer->scale,
+-			.width = layer->image->width * layer->scale,
+-			.height = layer->image->height * layer->scale,
++			.width = layer->image->width * layer->scale / upscale,
++			.height = layer->image->height * layer->scale / upscale,
+ 		};
+ 		backend->setLayerDimensions(backend, layer->layer, &frame);
+ 		layer->dimsDirty = false;
+@@ -246,7 +263,7 @@ void mScriptContextAttachCanvas(struct mScriptContext* context) {
+ }
+ 
+ mSCRIPT_DECLARE_STRUCT_VOID_METHOD(mScriptCanvasContext, _deinit, mScriptCanvasContextDeinit, 0);
+-mSCRIPT_DECLARE_STRUCT_METHOD(mScriptCanvasContext, W(mScriptCanvasLayer), newLayer, mScriptCanvasLayerCreate, 2, S32, width, S32, height);
++mSCRIPT_DECLARE_STRUCT_METHOD_WITH_DEFAULTS(mScriptCanvasContext, W(mScriptCanvasLayer), newLayer, mScriptCanvasLayerCreate, 3, S32, width, S32, height, S32, upscale);
+ mSCRIPT_DECLARE_STRUCT_VOID_METHOD(mScriptCanvasContext, update, _mScriptCanvasUpdate, 0);
+ mSCRIPT_DECLARE_STRUCT_METHOD(mScriptCanvasContext, U32, width, _mScriptCanvasWidth, 0);
+ mSCRIPT_DECLARE_STRUCT_METHOD(mScriptCanvasContext, U32, height, _mScriptCanvasHeight, 0);
+@@ -258,7 +275,12 @@ mSCRIPT_DEFINE_STRUCT(mScriptCanvasContext)
+ 		"A canvas that can be used for drawing images on or around the screen."
+ 	)
+ 	mSCRIPT_DEFINE_STRUCT_DEINIT(mScriptCanvasContext)
+-	mSCRIPT_DEFINE_DOCSTRING("Create a new layer of a given size. If multiple layers overlap, the most recently created one takes priority.")
++	mSCRIPT_DEFINE_DOCSTRING(
++		"Create a new layer of a given size. If multiple layers overlap, the most recently "
++		"created one takes priority. The optional upscale factor (default 1) makes the "
++		"backing image upscale× larger than the layer's on-screen size, allowing "
++		"high-resolution overlay drawing."
++	)
+ 	mSCRIPT_DEFINE_STRUCT_METHOD(mScriptCanvasContext, newLayer)
+ 	mSCRIPT_DEFINE_DOCSTRING("Update all layers marked as having pending changes")
+ 	mSCRIPT_DEFINE_STRUCT_METHOD(mScriptCanvasContext, update)
+@@ -272,6 +294,12 @@ mSCRIPT_DEFINE_STRUCT(mScriptCanvasContext)
+ 	mSCRIPT_DEFINE_STRUCT_METHOD(mScriptCanvasContext, screenHeight)
+ mSCRIPT_DEFINE_END;
+ 
++mSCRIPT_DEFINE_STRUCT_BINDING_DEFAULTS(mScriptCanvasContext, newLayer)
++	mSCRIPT_NO_DEFAULT,
++	mSCRIPT_NO_DEFAULT,
++	mSCRIPT_S32(1)
++mSCRIPT_DEFINE_DEFAULTS_END;
++
+ mSCRIPT_DECLARE_STRUCT_VOID_METHOD(mScriptCanvasLayer, update, mScriptCanvasLayerInvalidate, 0);
+ mSCRIPT_DECLARE_STRUCT_VOID_METHOD(mScriptCanvasLayer, setPosition, mScriptCanvasLayerSetPosition, 2, S32, x, S32, y);
+ 
