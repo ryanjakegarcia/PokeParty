@@ -42,7 +42,13 @@ whole canvas scales together.
 - `gen3.lua` — Gen 3 decoding: game detection, party decryption, badges,
   Pokédex flags, ROM table discovery (species names/types found by
   byte-pattern scan, cached via mGBA script storage)
+- `wheel.lua` — spinning wheel overlay: drunklocke bonus/punishment picker
+- `audio.lua` — sound effects: game events, low-HP danger music
 - `pokemgba` — launcher wrapper
+- `Makefile` — setup automation: install deps, build patched mGBA, configure display
+- `SETUP.md` — manual setup walkthrough (for Linux)
+- `mgba-patches/` — git patch: high-resolution canvas support
+- `sounds/` — .wav files: event cues and danger music
 
 ## How it works
 

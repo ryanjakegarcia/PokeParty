@@ -3,6 +3,20 @@
 
 local gen3 = {}
 
+gen3.log = function(msg) console:log("PokéParty: " .. msg) end
+
+-- dedupe pcall-failure logging per call site: only log when the error
+-- STRING actually changes from the last one logged for that context, so a
+-- persistently-failing read doesn't spam the log every frame. Keyed per
+-- context (not globally) so unrelated failures in different functions each
+-- get logged once independently.
+local lastErrors = {}
+local function logPcallFailure(context, err)
+	if lastErrors[context] == tostring(err) then return end
+	lastErrors[context] = tostring(err)
+	gen3.log(string.format("%s failed: %s", context, tostring(err)))
+end
+
 -- ========================================================================
 -- Gen 3 proprietary text charset (Western)
 -- ========================================================================
@@ -95,7 +109,10 @@ gen3.TYPE_NAMES = {
 -- ========================================================================
 function gen3.detect()
 	local ok, code = pcall(function() return emu:readRange(0x080000AC, 4) end)
-	if not ok or not code then return nil end
+	if not ok or not code then
+		if not ok then logPcallFailure("detect: ROM header game-code read", code) end
+		return nil
+	end
 	local game = GAMES[code]
 	if not game then return nil end
 	local g = {}
@@ -131,8 +148,12 @@ local function scanROM(pattern, verify)
 			return emu:readRange(0x08000000 + base, CHUNK + overlap)
 		end)
 		if not ok or not data then
+			if not ok then logPcallFailure("scanROM: ROM chunk+overlap read", data) end
 			ok, data = pcall(function() return emu:readRange(0x08000000 + base, CHUNK) end)
-			if not ok or not data then return nil end
+			if not ok or not data then
+				if not ok then logPcallFailure("scanROM: ROM chunk read (fallback)", data) end
+				return nil
+			end
 		end
 		local pos = 0
 		while true do
@@ -153,7 +174,10 @@ local function verifyStatsAnchor(hit)
 	local ok, data = pcall(function()
 		return emu:readRange(0x08000000 + tbl, 10 * 28)
 	end)
-	if not ok or not data then return false end
+	if not ok or not data then
+		if not ok then logPcallFailure("verifyStatsAnchor: stats table chunk read", data) end
+		return false
+	end
 	for sp, expect in pairs(STATS_EXPECT) do
 		if data:sub(sp * 28 + 20, sp * 28 + 22) ~= expect then return false end
 	end
@@ -164,6 +188,7 @@ end
 function gen3.romIdent(game)
 	if game.ident then return game.ident end
 	local okC, crc = pcall(function() return emu:checksum() end)
+	if not okC then logPcallFailure("romIdent: checksum read", crc) end
 	game.ident = okC and crc and (crc:gsub(".", function(c)
 		return string.format("%02x", c:byte())
 	end)) or game.code
@@ -176,10 +201,11 @@ function gen3.locateTables(game, bucket)
 	-- storage returns tables as userdata wrappers; type() lies but field
 	-- access works, so probe fields directly
 	local cNames, cStats
-	pcall(function()
+	local okCache, errCache = pcall(function()
 		local v = bucket and bucket[key]
 		if v then cNames, cStats = v.names, v.stats end
 	end)
+	if not okCache then logPcallFailure("locateTables: script storage cache lookup", errCache) end
 	if type(cNames) == "number" and type(cStats) == "number" then
 		game.namesTable = cNames
 		game.statsTable = cStats
@@ -199,7 +225,10 @@ end
 function gen3.speciesName(game, id)
 	if not game.namesTable or id < 0 or id > 439 then return "?" end
 	local ok, raw = pcall(function() return emu:readRange(game.namesTable + id * 11, 11) end)
-	if not ok or not raw then return "?" end
+	if not ok or not raw then
+		if not ok then logPcallFailure("speciesName: name table read", raw) end
+		return "?"
+	end
 	return gen3.decodeText(raw)
 end
 
@@ -207,7 +236,10 @@ function gen3.speciesTypes(game, id)
 	if not game.statsTable or id < 1 or id > 439 then return nil, nil end
 	local base = game.statsTable + id * 28
 	local ok, t1, t2 = pcall(function() return emu:read8(base + 6), emu:read8(base + 7) end)
-	if not ok then return nil, nil end
+	if not ok then
+		logPcallFailure("speciesTypes: stats table type-byte read", t1)
+		return nil, nil
+	end
 	return t1, t2
 end
 
@@ -226,7 +258,10 @@ function gen3.findSavePtrs(game, party, bucket)
 		local ok, lo, hi = pcall(function()
 			return emu:read16(sb2ptr + SB2_TRAINER_ID), emu:read16(sb2ptr + SB2_TRAINER_ID + 2)
 		end)
-		if not ok then return false end
+		if not ok then
+			logPcallFailure("findSavePtrs: trainer id read", lo)
+			return false
+		end
 		local tid = lo | (hi << 16)
 		for _, mon in ipairs(party) do
 			if mon.otId == tid then return true end
@@ -237,6 +272,7 @@ function gen3.findSavePtrs(game, party, bucket)
 	local cached = bucket and tonumber(bucket[key])
 	if cached then
 		local ok, b = pcall(function() return emu:read32(cached + 4) end)
+		if not ok then logPcallFailure("findSavePtrs: cached save-pointer read", b) end
 		if ok and b and (b & 0xFF000000) == 0x02000000 and tidMatches(b) then
 			game.sb1, game.sb2 = cached, cached + 4
 			return true
@@ -244,7 +280,10 @@ function gen3.findSavePtrs(game, party, bucket)
 	end
 
 	local ok, iwram = pcall(function() return emu:readRange(0x03000000, 0x8000) end)
-	if not ok or not iwram then return false end
+	if not ok or not iwram then
+		if not ok then logPcallFailure("findSavePtrs: IWRAM full-range read", iwram) end
+		return false
+	end
 	for off = 0, #iwram - 8, 4 do
 		local a = string.unpack("<I4", iwram, off + 1)
 		if (a & 0xFF000000) == 0x02000000 then
@@ -265,9 +304,15 @@ local function saveBlocks(game)
 	if game.ptrMode then
 		local ok
 		ok, sb1 = pcall(function() return emu:read32(game.sb1) end)
-		if not ok then return nil end
+		if not ok then
+			logPcallFailure("saveBlocks: SaveBlock1 pointer read", sb1)
+			return nil
+		end
 		ok, sb2 = pcall(function() return emu:read32(game.sb2) end)
-		if not ok then return nil end
+		if not ok then
+			logPcallFailure("saveBlocks: SaveBlock2 pointer read", sb2)
+			return nil
+		end
 	end
 	-- validate: must point into EWRAM
 	if (sb1 & 0xFF000000) ~= 0x02000000 or (sb2 & 0xFF000000) ~= 0x02000000 then
@@ -278,7 +323,10 @@ end
 
 local function popcountRange(addr, len)
 	local ok, data = pcall(function() return emu:readRange(addr, len) end)
-	if not ok or not data then return 0 end
+	if not ok or not data then
+		if not ok then logPcallFailure("popcountRange: bitfield byte-range read", data) end
+		return 0
+	end
 	local n = 0
 	for i = 1, #data do
 		local b = data:byte(i)
@@ -296,6 +344,7 @@ local function popcountBits(addr, nbits)
 	local rem = nbits % 8
 	if rem > 0 then
 		local ok, b = pcall(function() return emu:read8(addr + nbits // 8) end)
+		if not ok then logPcallFailure("popcountBits: remainder-bit byte read", b) end
 		if ok and b then
 			b = b & ((1 << rem) - 1)
 			while b > 0 do
@@ -316,6 +365,7 @@ function gen3.readTrainerStats(game)
 	for i = 0, 7 do
 		local f = game.badgeFlag + i
 		local ok, byte = pcall(function() return emu:read8(flagsBase + (f >> 3)) end)
+		if not ok then logPcallFailure("readTrainerStats: badge flag byte read", byte) end
 		if ok and byte and (byte & (1 << (f & 7))) ~= 0 then
 			badges = badges + 1
 		end
@@ -323,6 +373,7 @@ function gen3.readTrainerStats(game)
 	local caught = popcountRange(sb2 + SB2_DEX_OWNED, 52)
 	local seen = popcountRange(sb2 + SB2_DEX_SEEN, 52)
 	local okTid, tid = pcall(function() return emu:read32(sb2 + SB2_TRAINER_ID) end)
+	if not okTid then logPcallFailure("readTrainerStats: trainer id read", tid) end
 	local trainers = 0
 	if game.trainerFlag then
 		trainers = popcountBits(flagsBase + (game.trainerFlag >> 3), game.trainerCount)
@@ -347,10 +398,11 @@ end
 function gen3.locateIconTables(game, bucket)
 	local key = "icons_" .. game.code .. "_" .. gen3.romIdent(game)
 	local cTbl, cN, cIdx, cPal
-	pcall(function()
+	local okCache, errCache = pcall(function()
 		local v = bucket and bucket[key]
 		if v then cTbl, cN, cIdx, cPal = v.tbl, v.n, v.idx, v.pal end
 	end)
+	if not okCache then logPcallFailure("locateIconTables: script storage cache lookup", errCache) end
 	if type(cTbl) == "number" and type(cN) == "number"
 		and type(cIdx) == "number" and type(cPal) == "number" then
 		game.iconTable = cTbl
@@ -363,7 +415,10 @@ function gen3.locateIconTables(game, bucket)
 	local run, runStart = 0, 0
 	for base = 0, 0x00FFFFFF, CHUNK do
 		local ok, data = pcall(function() return emu:readRange(0x08000000 + base, CHUNK) end)
-		if not ok or not data or #data < 4 then break end
+		if not ok or not data or #data < 4 then
+			if not ok then logPcallFailure("locateIconTables: ROM chunk read", data) end
+			break
+		end
 		for off = 0, #data - 4, 4 do
 			local w = string.unpack("<I4", data, off + 1)
 			if (w & 0xFE000000) == 0x08000000 then
@@ -373,6 +428,7 @@ function gen3.locateIconTables(game, bucket)
 				if run >= 410 then
 					local tblEnd = base + off
 					local okI, idx = pcall(function() return emu:readRange(0x08000000 + tblEnd, run) end)
+					if not okI then logPcallFailure("locateIconTables: palette-index array read", idx) end
 					if okI and idx then
 						local good, nonzero = true, 0
 						for i = 1, #idx do
@@ -417,12 +473,18 @@ function gen3.monIconImage(game, species, px)
 		local gfxPtr = emu:read32(game.iconTable + species * 4)
 		return emu:readRange(gfxPtr, 512), emu:read8(game.iconPalIdx + species)
 	end)
-	if not ok or not gfx or #gfx < 512 then return nil end
+	if not ok or not gfx or #gfx < 512 then
+		if not ok then logPcallFailure("monIconImage: icon gfx/pal-index read", gfx) end
+		return nil
+	end
 	local okP, palRaw = pcall(function()
 		local palPtr = emu:read32(game.iconPalTbl + palIdx * 8)
 		return emu:readRange(palPtr, 32)
 	end)
-	if not okP or not palRaw or #palRaw < 32 then return nil end
+	if not okP or not palRaw or #palRaw < 32 then
+		if not okP then logPcallFailure("monIconImage: icon palette color read", palRaw) end
+		return nil
+	end
 	local colors = {}
 	for i = 0, 15 do
 		local c = string.unpack("<I2", palRaw, i * 2 + 1)
@@ -463,7 +525,10 @@ function gen3.giveItem(game, itemId, qty)
 	local key = 0
 	if game.secKeyOfs then
 		local ok, k = pcall(function() return emu:read32(sb2 + game.secKeyOfs) end)
-		if not ok or not k then return nil end
+		if not ok or not k then
+			if not ok then logPcallFailure("giveItem: security key read", k) end
+			return nil
+		end
 		key = k & 0xFFFF
 	end
 	local base = sb1 + game.bagOfs
@@ -471,7 +536,10 @@ function gen3.giveItem(game, itemId, qty)
 	for i = 0, game.bagSlots - 1 do
 		local addr = base + i * 4
 		local ok, id, q = pcall(function() return emu:read16(addr), emu:read16(addr + 2) end)
-		if not ok then return nil end
+		if not ok then
+			logPcallFailure("giveItem: bag slot id/qty read", id)
+			return nil
+		end
 		if id == 0 then
 			empty = empty or addr
 		else
@@ -483,16 +551,18 @@ function gen3.giveItem(game, itemId, qty)
 			end
 			if id == itemId then
 				if quantity >= qty then return nil end
-				pcall(function() emu:write16(addr + 2, qty ~ key) end)
+				local okW1, errW1 = pcall(function() emu:write16(addr + 2, qty ~ key) end)
+				if not okW1 then logPcallFailure("giveItem: bag slot quantity write (top-off)", errW1) end
 				return "topped"
 			end
 		end
 	end
 	if empty then
-		local okW = pcall(function()
+		local okW, errW = pcall(function()
 			emu:write16(empty, itemId)
 			emu:write16(empty + 2, qty ~ key)
 		end)
+		if not okW then logPcallFailure("giveItem: bag slot write (new item)", errW) end
 		if okW then return "added" end
 	end
 	return nil, "bag full"
@@ -537,13 +607,19 @@ BADGE_GFX_ADDR.AXPE = BADGE_GFX_ADDR.BPEE
 
 local function lz77Decompress(addr)
 	local ok, hdr = pcall(function() return emu:readRange(addr, 4) end)
-	if not ok or not hdr or #hdr < 4 or hdr:byte(1) ~= 0x10 then return nil end
+	if not ok or not hdr or #hdr < 4 or hdr:byte(1) ~= 0x10 then
+		if not ok then logPcallFailure("lz77Decompress: header read", hdr) end
+		return nil
+	end
 	local size = hdr:byte(2) | (hdr:byte(3) << 8) | (hdr:byte(4) << 16)
 	if size <= 0 or size > 0x10000 then return nil end
 	-- compressed data is never larger than ~9/8 of decompressed size in
 	-- the GBA LZ77 format; 2x is a safe upper bound on how much to read
 	local ok2, src = pcall(function() return emu:readRange(addr + 4, size * 2) end)
-	if not ok2 or not src then return nil end
+	if not ok2 or not src then
+		if not ok2 then logPcallFailure("lz77Decompress: compressed source read", src) end
+		return nil
+	end
 	local out = {}
 	local pos, n = 1, 0
 	while n < size do
@@ -689,7 +765,10 @@ local function tryDecodeBossParty(structBase)
 	local ok, hdr = pcall(function()
 		return emu:readRange(0x08000000 + structBase, TRAINER_STRUCT_SIZE)
 	end)
-	if not ok or not hdr or #hdr < TRAINER_STRUCT_SIZE then return nil end
+	if not ok or not hdr or #hdr < TRAINER_STRUCT_SIZE then
+		if not ok then logPcallFailure("tryDecodeBossParty: trainer struct header read", hdr) end
+		return nil
+	end
 	local partyFlags = hdr:byte(1)
 	if not partyFlags or partyFlags > 3 then return nil end
 	local partySize = hdr:byte(0x21)
@@ -698,7 +777,10 @@ local function tryDecodeBossParty(structBase)
 	if (ptr & 0xFF000000) ~= 0x08000000 then return nil end
 	local stride = PARTY_STRIDE[partyFlags]
 	local okP, data = pcall(function() return emu:readRange(ptr, partySize * stride) end)
-	if not okP or not data or #data < partySize * stride then return nil end
+	if not okP or not data or #data < partySize * stride then
+		if not okP then logPcallFailure("tryDecodeBossParty: boss party data read", data) end
+		return nil
+	end
 	local maxLevel = 0
 	for m = 0, partySize - 1 do
 		local lvl = data:byte(m * stride + 3)
@@ -770,6 +852,7 @@ function gen3.isTrainerBeaten(game, trainerId)
 	local flagsBase = sb1 + game.flagsOfs
 	local f = (game.trainerFlag or 0x500) + trainerId
 	local ok, byte = pcall(function() return emu:read8(flagsBase + (f >> 3)) end)
+	if not ok then logPcallFailure("isTrainerBeaten: trainer flag byte read", byte) end
 	return ok and byte and (byte & (1 << (f & 7))) ~= 0
 end
 
@@ -788,8 +871,12 @@ local function scanForBossByName(stageName)
 			return emu:readRange(0x08000000 + base, CHUNK + overlap)
 		end)
 		if not ok or not data then
+			if not ok then logPcallFailure("scanForBossByName: ROM chunk+overlap read", data) end
 			ok, data = pcall(function() return emu:readRange(0x08000000 + base, CHUNK) end)
-			if not ok or not data then break end
+			if not ok or not data then
+				if not ok then logPcallFailure("scanForBossByName: ROM chunk read (fallback)", data) end
+				break
+			end
 		end
 		local pos = 0
 		while true do
@@ -809,7 +896,10 @@ end
 -- sanity-check a direct-addressed candidate before trusting it.
 local function verifyBossAt(structBase, expectedName)
 	local ok, raw = pcall(function() return emu:readRange(0x08000000 + structBase, 16) end)
-	if not ok or not raw or #raw < 16 then return false end
+	if not ok or not raw or #raw < 16 then
+		if not ok then logPcallFailure("verifyBossAt: trainer name read", raw) end
+		return false
+	end
 	return gen3.decodeText(raw:sub(5, 16)) == expectedName
 end
 
@@ -838,10 +928,11 @@ function gen3.locateStageBoss(game, stageKey, bucket)
 
 	local cacheKey = "boss2_" .. game.code .. "_" .. gen3.romIdent(game) .. "_" .. stageKey
 	local cachedLvl
-	pcall(function()
+	local okCached, errCached = pcall(function()
 		local v = bucket and bucket[cacheKey]
 		if type(v) == "number" then cachedLvl = v end
 	end)
+	if not okCached then logPcallFailure("locateStageBoss: cached boss level lookup", errCached) end
 	if cachedLvl then
 		game.bossCaps[stageKey] = { id = stage.id, maxLevel = cachedLvl, label = stage.label }
 		return game.bossCaps[stageKey]
@@ -850,10 +941,11 @@ function gen3.locateStageBoss(game, stageKey, bucket)
 	local level = nil
 	local anchorKey = "tblstart_" .. game.code .. "_" .. gen3.romIdent(game)
 	local tableStart
-	pcall(function()
+	local okAnchor, errAnchor = pcall(function()
 		local v = bucket and bucket[anchorKey]
 		if type(v) == "number" then tableStart = v end
 	end)
+	if not okAnchor then logPcallFailure("locateStageBoss: trainer table anchor lookup", errAnchor) end
 	if not tableStart then
 		local anchorBase, anchorLevel = scanForBossByName(stage.name)
 		if anchorBase then
@@ -969,6 +1061,7 @@ function gen3.readEnemyParty(game)
 	local mons = {}
 	for i = 0, 5 do
 		local ok, raw = pcall(function() return emu:readRange(game.enemyParty + i * 100, 100) end)
+		if not ok then logPcallFailure("readEnemyParty: enemy party slot read", raw) end
 		if ok and raw and #raw == 100 then
 			local mon = decodeMon(raw)
 			if mon then mons[#mons + 1] = mon end
@@ -979,10 +1072,14 @@ end
 
 function gen3.readParty(game)
 	local ok, count = pcall(function() return emu:read8(game.partyCount) end)
-	if not ok or not count or count == 0 or count > 6 then return {} end
+	if not ok or not count or count == 0 or count > 6 then
+		if not ok then logPcallFailure("readParty: party count read", count) end
+		return {}
+	end
 	local party = {}
 	for i = 0, count - 1 do
 		local okR, raw = pcall(function() return emu:readRange(game.party + i * 100, 100) end)
+		if not okR then logPcallFailure("readParty: party slot read", raw) end
 		if okR and raw and #raw == 100 then
 			local mon = decodeMon(raw)
 			if mon then

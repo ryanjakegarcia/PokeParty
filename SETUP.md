@@ -109,7 +109,12 @@ if you cloned mGBA somewhere else, edit that one line in the script.
 |---|---|---|
 | `POKEPARTY_HUD_SCALE` | 4 | Side panel / strip backing-image upscale factor |
 | `POKEPARTY_STRIP_H` | 24 | Top/bottom strip height (24 = tuned for 1080p fullscreen) |
+| `POKEPARTY_BADGE_COLORS` | color | Badge color mode ('color' = stylized, 'silver' = in-game accurate) |
 | `POKEPARTY_CANDY` | 99 | Rare Candy cheat target count (0 disables) |
+| `POKEPARTY_CANDY_KEY` | c | Keyboard hotkey for Rare Candy cheat (single character) |
+| `POKEPARTY_CANDY_PAD` | unset | Gamepad button number for Rare Candy cheat |
+| `POKEPARTY_SOUND` | 1 | Enable sound effects (0 = disable) |
+| `POKEPARTY_SFX_VOLUME` | 80 | Sound effect volume (0-100 percent) |
 | `POKEPARTY_DEBUG` | unset | Dir path — writes `pokeparty.log` + panel/strip PNG snapshots |
 
 ## Troubleshooting
