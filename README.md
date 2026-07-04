@@ -78,6 +78,12 @@ Hotkeys: **R** = rival beaten (+1 shot, manual — rival battles aren't
 reliably detectable across randomizers), **I** = toggle ★important on the
 lead party mon (persisted), **W** = spin the wheel manually.
 
+Manual counter correction (for a tracking bug or a new house-rule invented
+mid-run): **[** / **]** = drink -1 / +1, **;** / **'** = shot -1 / +1,
+**,** / **.** = revive -1 / +1. Left of each pair decrements, right
+increments; every press flashes a confirmation banner and persists through
+the normal save-gated commit like any other counter change.
+
 The wheel (auto after each gym) is a hi-res disc centered over the game:
 spinning arrow, decaying spin (~4s), result banner for 5s. Edit
 `wheel.SEGMENTS` at the top of `wheel.lua` for house rules — wedges with

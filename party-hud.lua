@@ -31,6 +31,16 @@ local KEY_RIVAL = ("r"):upper():byte()     -- rival beaten = 1 shot (manual)
 local KEY_IMPORTANT = ("i"):upper():byte() -- toggle lead mon "important"
 local KEY_WHEEL = ("w"):upper():byte()     -- spin the wheel manually
 
+-- manual counter correction, for bugs or new house-rules mid-run: left key
+-- of each pair = -1, right key = +1. Punctuation row, doesn't collide with
+-- anything above and reads consistently left=down/right=up.
+local KEY_DRINK_DOWN  = ("["):byte()
+local KEY_DRINK_UP    = ("]"):byte()
+local KEY_SHOT_DOWN   = (";"):byte()
+local KEY_SHOT_UP     = ("'"):byte()
+local KEY_REVIVE_DOWN = (","):byte()
+local KEY_REVIVE_UP   = ("."):byte()
+
 local function log(msg)
 	console:log("PokéParty: " .. msg)
 	if DEBUG_LOG then
@@ -110,6 +120,41 @@ local TYPE_COLORS = {
 	0xFFA8B820,0xFF705898,0xFFB8B8D0,0xFF68A090,0xFFF08030,0xFF6890F0,
 	0xFF78C850,0xFFF8D030,0xFFF85888,0xFF98D8D8,0xFF7038F8,0xFF705848,
 }
+
+-- badge color mode: "color" = stylized per-badge-type hue (not screen-
+-- accurate — Gen3 only ever renders every badge in plain silver, see
+-- gen3.badgeIconImage — but far easier to tell apart at a glance); "silver"
+-- = the real in-game monochrome medal look. Override with
+-- POKEPARTY_BADGE_COLORS=silver.
+local BADGE_COLOR_MODE = (os.getenv("POKEPARTY_BADGE_COLORS") or "color"):lower()
+
+-- BPRE (Kanto: Boulder/Cascade/Thunder/Rainbow/Soul/Marsh/Volcano/Earth)
+-- sampled directly from the user's reference art (Downloads/hoenn2.png,
+-- despite the filename — it's actually Kanto). Order matches gym progression.
+local BADGE_HUES = {
+	BPRE = { -- Boulder(gray/tan, not gold - corrected per user), Cascade, Thunder, Rainbow, Soul, Marsh, Volcano, Earth
+		0xFFB8AE8C, 0xFF4A7FA8, 0xFFD4AF37, 0xFFF0603A,
+		0xFF7A7B7E, 0xFF4F9195, 0xFFEC4066, 0xFF7FC6ED,
+	},
+}
+BADGE_HUES.BPGE = BADGE_HUES.BPRE
+-- Hoenn: Stone/Knuckle/Dynamo/Heat/Balance/Feather/Mind/Rain — sampled
+-- directly from Bulbapedia's badge reference chart (user screenshot).
+BADGE_HUES.BPEE = {
+	0xFFCBC7AD, 0xFFFFAC59, 0xFFFCD659, 0xFFEF7374,
+	0xFFC1C2C1, 0xFFADD2F5, 0xFFF584A8, 0xFF74ACF5,
+}
+BADGE_HUES.AXVE = BADGE_HUES.BPEE
+BADGE_HUES.AXPE = BADGE_HUES.BPEE
+
+-- earned badges show the hue at full strength; not-yet-earned render
+-- blacked-out (not just dimmed) so obtaining one reads as a clear reveal
+local function dimColor(hex, factor)
+	local r = math.floor(((hex >> 16) & 0xFF) * factor)
+	local g = math.floor(((hex >> 8) & 0xFF) * factor)
+	local b = math.floor((hex & 0xFF) * factor)
+	return 0xFF000000 | (r << 16) | (g << 8) | b
+end
 
 local COND_COLORS = {
 	FNT = 0xFFE5484D, SLP = 0xFF8A93A0, PSN = 0xFFA040A0, TOX = 0xFF7C2E8C,
@@ -245,6 +290,7 @@ local function detectGame()
 	state.stats = nil
 	state.prevHP = {}
 	state.prevSpecies = {}
+	state.pendingEvoCredits = 0
 	state.rawStable = nil -- {tid,caught,trainers,badges}, for the 2-tick stability gate
 	state.lastSig = nil
 	state.ptrScanTick = nil
@@ -252,6 +298,9 @@ local function detectGame()
 	state.icons = {}      -- species -> icon image (strong refs, cacheable)
 	state.iconsReady = false
 	state.iconsTried = false
+	state.badgeIcons = {} -- badge index -> mask image (strong refs, cacheable)
+	state.badgesReady = false
+	state.badgesTried = false
 	state.ds = nil          -- {drinks, shots, levelCapDelta, extraCatch, caught, trainers, badges, faints, important}
 	state.dsCommitted = nil -- last values written to disk; rollback target
 	state.dsDirty = false
@@ -359,11 +408,24 @@ local function refresh()
 			log("icon table not found — sprites disabled")
 		end
 	end
+	if not state.badgesReady and not state.badgesTried then
+		state.badgesTried = true
+		state.badgesReady = gen3.locateBadgeIcons(game)
+		log(state.badgesReady and "badge graphics decoded"
+			or "badge graphics not found — falling back to plain squares")
+	end
 	state.party = gen3.readParty(game)
 	-- must run every refresh (not gated behind saveReady) so prevSpecies
 	-- stays in sync and the first tick after a save loads doesn't get
 	-- misread as a pile of simultaneous "evolutions"
-	local evolutions = countEvolutions()
+	-- accumulate into a persistent pool rather than consuming same-tick:
+	-- the species field can change (detected here) on an earlier tick than
+	-- the dex-owned/caught counter actually reflects it (evolution
+	-- animation spans several ticks before the Pokédex registration
+	-- settles), so a same-tick "evolutions - n" subtraction can miss and
+	-- wrongly count the evolution as a real catch (observed live: evolving
+	-- Ivysaur both flashed CAUGHT! and consumed an x2-catch charge)
+	state.pendingEvoCredits = (state.pendingEvoCredits or 0) + countEvolutions()
 	state.stats = gen3.readTrainerStats(game)
 	-- rebuilt hacks move the SaveBlock pointers: party reads fine but stats
 	-- don't. Locate the pointers by matching the party's OT id in IWRAM.
@@ -465,8 +527,11 @@ local function refresh()
 				state.dsDirty = true
 				-- evolution also marks the evolved species "owned" — subtract
 				-- out however many of this tick's dex-owned bumps came from
-				-- evolutions, not real catches (see countEvolutions above)
-				local realCatches = math.max(0, n - evolutions)
+				-- evolutions, not real catches. Drawn from the accumulated
+				-- pool (see above), not a same-tick count.
+				local evoCredit = math.min(n, state.pendingEvoCredits or 0)
+				state.pendingEvoCredits = (state.pendingEvoCredits or 0) - evoCredit
+				local realCatches = math.max(0, n - evoCredit)
 				if realCatches > 0 then
 					ds.drinks = ds.drinks + realCatches
 					-- x2 catch: bonus is consumed by the very next catch(es)
@@ -578,6 +643,26 @@ local function hpColor(hp, maxHP)
 	return C.hpRed
 end
 
+-- draws a badge/icon mask tinted with `color` (drawMask multiplies the
+-- painter's fill color against the mask's alpha, so the mask itself is
+-- just solid-white ink on transparent — see gen3.badgeIconImage)
+local function mask(p, img, x, y, color)
+	p:setFill(true)
+	p:setFillColor(color)
+	p:drawMask(img, x * S, y * S)
+end
+
+-- cached badge icon mask (image objects are method returns → strong)
+local function getBadgeIcon(index, px)
+	if not state.badgesReady then return nil end
+	local icon = state.badgeIcons[index]
+	if icon == nil then
+		icon = gen3.badgeIconImage(state.game, index, px * S) or false
+		state.badgeIcons[index] = icon
+	end
+	return icon or nil
+end
+
 -- cached 16x16 icon for a mon (image objects are method returns → strong)
 local function getIcon(mon)
 	if not state.iconsReady then return nil end
@@ -663,10 +748,15 @@ local function drawTopStrip()
 		bg = state.dsWasRegressed and C.warnBg or C.accent
 	end
 	rect(p, 0, 0, STRIP_W, STRIP_H, bg)
+	p:setBlend(true)
 	if active then
-		p:setBlend(true)
 		local fg = state.dsWasRegressed and 0xFFECEFF4 or 0xFF10141D
 		text(p, state.flash.text, STRIP_W // 2, STRIP_H // 2, 13, fg, VC)
+	elseif state.game then
+		text(p, state.game.name:upper(), STRIP_W // 2, STRIP_H // 2, 13, C.text, VC)
+		if state.stats then
+			text(p, string.format("ID %05d", state.stats.tid), STRIP_W - 10, STRIP_H // 2, 11, C.dim, VR)
+		end
 	end
 	state.topLayer:update()
 	canvas:update()
@@ -756,21 +846,36 @@ local function draw()
 		return
 	end
 
-	-- header: game name + trainer id + badges only (level cap / drinks /
-	-- shots / faints now live full-width in the bottom strip)
-	text(p, state.game.name:upper(), 5, 1, 9, C.text)
+	-- header: badges only now — game name moved to the top strip, trainer
+	-- id dropped (level cap / drinks / shots / faints live full-width in
+	-- the bottom strip)
 	if state.stats then
-		text(p, string.format("%05d", state.stats.tid), w - 4, 2, 7, C.dim, TR)
+		local iconPx = 13
+		local pitch = (w - 8) / 8
 		for i = 0, 7 do
-			rect(p, 5 + i * 9, 12, 7, 4, i < state.stats.badges and C.badgeOn or C.badgeOff)
+			local earned = i < state.stats.badges
+			local icon = getBadgeIcon(i, iconPx)
+			local color
+			local hues = BADGE_HUES[state.game.code]
+			if icon and BADGE_COLOR_MODE == "color" and hues then
+				color = earned and hues[i + 1] or dimColor(hues[i + 1], 0.08)
+			else
+				color = earned and C.badgeOn or C.badgeOff
+			end
+			local x = 4 + i * pitch
+			if icon then
+				mask(p, icon, x, 4, color)
+			else
+				rect(p, x, 8, iconPx, 6, color)
+			end
 		end
 	else
-		text(p, "Waiting for save…", 5, 14, 8, C.dim)
+		text(p, "Waiting for save…", 5, 8, 8, C.dim)
 	end
-	rect(p, 3, 20, w - 6, 1, C.line)
+	rect(p, 3, 21, w - 6, 1, C.line)
 
 	-- party rows
-	local y = 22
+	local y = 23
 	for _, mon in ipairs(state.party) do
 		drawMonRow(p, 3, y, w - 6, mon)
 		y = y + 20
@@ -966,6 +1071,30 @@ callbacks:add("key", function(ev)
 		pcall(toggleImportant)
 	elseif k == KEY_WHEEL then
 		pcall(wheel.spin)
+	elseif state.ds and (k == KEY_DRINK_DOWN or k == KEY_DRINK_UP
+			or k == KEY_SHOT_DOWN or k == KEY_SHOT_UP
+			or k == KEY_REVIVE_DOWN or k == KEY_REVIVE_UP) then
+		local ds = state.ds
+		if k == KEY_DRINK_UP then
+			ds.drinks = ds.drinks + 1
+			flash("DRINK +1 (MANUAL)")
+		elseif k == KEY_DRINK_DOWN then
+			ds.drinks = math.max(0, ds.drinks - 1)
+			flash("DRINK -1 (MANUAL)")
+		elseif k == KEY_SHOT_UP then
+			ds.shots = ds.shots + 1
+			flash("SHOT +1 (MANUAL)")
+		elseif k == KEY_SHOT_DOWN then
+			ds.shots = math.max(0, ds.shots - 1)
+			flash("SHOT -1 (MANUAL)")
+		elseif k == KEY_REVIVE_UP then
+			ds.revives = ds.revives + 1
+			flash("REVIVE +1 (MANUAL)")
+		elseif k == KEY_REVIVE_DOWN then
+			ds.revives = math.max(0, ds.revives - 1)
+			flash("REVIVE -1 (MANUAL)")
+		end
+		state.dsDirty = true
 	end
 end)
 callbacks:add("gamepadButton", function(ev)

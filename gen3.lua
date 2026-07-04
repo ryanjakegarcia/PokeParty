@@ -494,6 +494,157 @@ function gen3.giveItem(game, itemId, qty)
 end
 
 -- ========================================================================
+-- Badge icons (real sprites instead of plain squares)
+-- ========================================================================
+-- Badge graphics are LZ77-compressed in ROM (pret: sHoennTrainerCardBadges_Gfx
+-- / sKantoTrainerCardBadges_Gfx, "graphics/trainer_card/badges.png" resp.
+-- ".../frlg/badges.png") — unlike species icons, which are stored raw.
+-- mGBA's scripting API has no decompression built in, so this is a small
+-- from-scratch GBA-format LZ77 decoder.
+--
+-- Layout, read directly from pret's DrawStarsAndBadgesOnCard: badge i's four
+-- 8x8 tiles sit at buffer positions 2i, 2i+1, 16+2i, 17+2i (a 16-tile-wide,
+-- 2-row grid) — NOT four consecutive tiles as a naive guess would assume.
+-- Confirmed by rendering and visually matching against the real 8 Hoenn and
+-- 8 Kanto badges.
+--
+-- We only extract the SHAPE (4bpp index 0 = transparent, anything else =
+-- ink) and tint it at draw time via mPainter:drawMask with the HUD's own
+-- accent colors, rather than also hunting for the exact in-ROM palette —
+-- simpler, one less thing to get wrong per-game, and matches the existing
+-- gold/gray earned-badge color language already in use.
+--
+-- Addresses are hardcoded per game rather than scanned: this is purely
+-- cosmetic UI data with no text/content anchor to scan for (unlike species
+-- names or trainer names), and randomizers never touch cosmetic ROM
+-- assets — only a full rebuild hack could move it, which the decompression
+-- validation below will simply fail closed against (falls back to the
+-- original colored squares).
+local BADGE_GFX_ADDR = {
+	BPEE = 0x0856F5CC, -- Hoenn badges; verified against a real Emerald ROM
+	BPRE = 0x083CD658, -- Kanto badges; verified against a real FireRed ROM
+}
+BADGE_GFX_ADDR.BPGE = BADGE_GFX_ADDR.BPRE -- LeafGreen shares FireRed's assets
+-- AXVE/AXPE (Ruby/Sapphire) presumably share Emerald's table, but this is
+-- UNVERIFIED against a real ROM — see backlog.
+BADGE_GFX_ADDR.AXVE = BADGE_GFX_ADDR.BPEE
+BADGE_GFX_ADDR.AXPE = BADGE_GFX_ADDR.BPEE
+
+local function lz77Decompress(addr)
+	local ok, hdr = pcall(function() return emu:readRange(addr, 4) end)
+	if not ok or not hdr or #hdr < 4 or hdr:byte(1) ~= 0x10 then return nil end
+	local size = hdr:byte(2) | (hdr:byte(3) << 8) | (hdr:byte(4) << 16)
+	if size <= 0 or size > 0x10000 then return nil end
+	-- compressed data is never larger than ~9/8 of decompressed size in
+	-- the GBA LZ77 format; 2x is a safe upper bound on how much to read
+	local ok2, src = pcall(function() return emu:readRange(addr + 4, size * 2) end)
+	if not ok2 or not src then return nil end
+	local out = {}
+	local pos, n = 1, 0
+	while n < size do
+		if pos > #src then return nil end
+		local flags = src:byte(pos); pos = pos + 1
+		for bit = 7, 0, -1 do
+			if n >= size then break end
+			if (flags & (1 << bit)) ~= 0 then
+				if pos + 1 > #src then return nil end
+				local b1, b2 = src:byte(pos), src:byte(pos + 1)
+				pos = pos + 2
+				local length = (b1 >> 4) + 3
+				local disp = ((b1 & 0xF) << 8) | b2
+				local start = n - disp - 1
+				if start < 0 then return nil end
+				for k = 0, length - 1 do
+					if n >= size then break end
+					n = n + 1
+					out[n] = out[start + k + 1]
+				end
+			else
+				if pos > #src then return nil end
+				n = n + 1
+				out[n] = src:byte(pos)
+				pos = pos + 1
+			end
+		end
+	end
+	-- string.char in chunks: some Lua builds cap how many args a single
+	-- call can take, 1024 individual bytes isn't safe to pass in one go
+	local chunks = {}
+	for i = 1, size, 200 do
+		chunks[#chunks + 1] = string.char(table.unpack(out, i, math.min(i + 199, size)))
+	end
+	return table.concat(chunks)
+end
+
+-- decompresses (once per session — cheap, not worth persisting across a
+-- restart) and validates the badge graphics for this game. Not cached to
+-- storage: raw binary doesn't round-trip safely through the JSON-backed
+-- bucket.
+function gen3.locateBadgeIcons(game)
+	if game.badgeData then return true end
+	local addr = BADGE_GFX_ADDR[game.code]
+	if not addr then return false end
+	local data = lz77Decompress(addr)
+	if not data or #data ~= 0x400 then return false end
+	game.badgeData = data
+	return true
+end
+
+-- 4bpp index -> grayscale shade, read directly from the real source art's
+-- embedded palette (graphics/trainer_card/badges.png, same file for both
+-- BPEE and BPRE — Gen3 renders every badge in this uniform silver-medal
+-- style, no per-badge hue at all in the actual game). Every badge only
+-- ever uses these five indices (confirmed by scanning all 8 badges in both
+-- games' source art): 1-4 are the bevel highlight/mid/shadow tones, 15 is
+-- the outline. Index 0 is the transparent background.
+local BADGE_SHADE = { [1] = 0xF8, [2] = 0xD0, [3] = 0xB0, [4] = 0x78, [15] = 0x00 }
+
+-- builds a px×px shaded mask for badge `index` (0-7), nearest-neighbor
+-- sampled from the native 16x16 grid. RGB carries the real highlight/
+-- shadow gradient (all three channels equal — i.e. grayscale); alpha is
+-- opaque everywhere there's ink, transparent on background. Pass to
+-- painter:drawMask with setFillColor: drawMask multiplies mask RGB by the
+-- fill color channelwise, so a white pixel takes the fill color at full
+-- strength and a gray pixel takes a proportionally darker shade of it —
+-- this reproduces the bevel with WHATEVER tint the caller picks, whether
+-- that's the real silver or a stylized per-badge hue.
+function gen3.badgeIconImage(game, index, px)
+	px = px or 16
+	if not game.badgeData or index < 0 or index > 7 then return nil end
+	local data = game.badgeData
+	local shade = {} -- 0-255 grayscale value, or nil = transparent
+	local function readQuadrant(tileIdx, ox, oy)
+		local base = tileIdx * 32
+		for r = 0, 7 do
+			for c = 0, 3 do
+				local byte = data:byte(base + r * 4 + c + 1)
+				if not byte then return end
+				local lo, hi = byte & 0xF, byte >> 4
+				shade[(oy + r) * 16 + (ox + c * 2)] = BADGE_SHADE[lo] or (lo ~= 0 and 0x90 or nil)
+				shade[(oy + r) * 16 + (ox + c * 2 + 1)] = BADGE_SHADE[hi] or (hi ~= 0 and 0x90 or nil)
+			end
+		end
+	end
+	readQuadrant(2 * index, 0, 0)
+	readQuadrant(2 * index + 1, 8, 0)
+	readQuadrant(16 + 2 * index, 0, 8)
+	readQuadrant(17 + 2 * index, 8, 8)
+
+	local img = image.new(px, px)
+	for y = 0, px - 1 do
+		local sy = y * 16 // px
+		for x = 0, px - 1 do
+			local sx = x * 16 // px
+			local v = shade[sy * 16 + sx]
+			if v then
+				img:setPixel(x, y, 0xFF000000 | (v << 16) | (v << 8) | v)
+			end
+		end
+	end
+	return img
+end
+
+-- ========================================================================
 -- Level cap tracking (gym/E4/champion boss levels)
 -- ========================================================================
 -- Boss trainer is located by name (encoded in the same charset as species
