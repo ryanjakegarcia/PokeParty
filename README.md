@@ -107,10 +107,14 @@ the emulator — mGBA's scripting API has no audio hooks of its own.
 - `sounds/revive1.wav` — REVIVE events
 - `sounds/faint1.wav` .. `faint5.wav` — regular faints, one picked at
   random
-- `sounds/important1.wav` .. `important4.wav` — ★important-mon faints,
-  own distinct pool (does NOT share the regular faint pool)
+- `sounds/important1.wav` .. `important4.wav` — currently unwired, not
+  played on anything. Was tried as a battle-entry cue (fire when a marked
+  ★important mon becomes the active battler) but that signal proved
+  unreliable (false-fired from just opening the party menu) and got
+  siloed; before that it played on important-mon faints specifically,
+  removed per feedback. Files left on disk for a future attempt.
 - `sounds/badge.wav` — gym beaten
-- `sounds/badwheel1.wav` .. `badwheel5.wav` — non-positive wheel outcomes
+- `sounds/badwheel1.wav` .. `badwheel4.wav` — non-positive wheel outcomes
   (SHOT!, DRINK x2, FINISH DRINK, KILL ★), one picked at random
 - `sounds/cheer.wav` + `partyblower_l.wav`/`partyblower_r.wav` (hard-panned
   L/R) — all three together on positive wheel outcomes EXCEPT REVIVE!
