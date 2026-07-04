@@ -95,23 +95,35 @@ rewinds resync counters instead of double-counting.
 Events play a short audio cue via `paplay`, backgrounded so it can't stall
 the emulator — mGBA's scripting API has no audio hooks of its own.
 
-- `sounds/shot.wav` — SHOT events
-- `sounds/drink1.wav`, `drink2.wav` — DRINK events, one picked at random
-- `sounds/revive1.wav`, `revive2.wav` — REVIVE events, one picked at random
-- `sounds/faint1.wav`, `faint2.wav` — faints, one picked at random, plays
-  alongside the usual shot cue
-- `sounds/badwheel.wav` — non-positive wheel outcomes (SHOT!, DRINK x2,
-  FINISH DRINK, KILL ★)
+- `sounds/shot1.wav`, `shot2.wav` — SHOT events, one picked at random
+- `sounds/drink1.wav`, `drink2.wav`, `drink3.wav` — DRINK events, one
+  picked at random
+- `sounds/revive1.wav` — REVIVE events
+- `sounds/faint1.wav` .. `faint5.wav` — regular faints, one picked at
+  random
+- `sounds/important1.wav` .. `important4.wav` — ★important-mon faints,
+  own distinct pool (does NOT share the regular faint pool)
+- `sounds/badge.wav` — gym beaten
+- `sounds/badwheel1.wav` .. `badwheel5.wav` — non-positive wheel outcomes
+  (SHOT!, DRINK x2, FINISH DRINK, KILL ★), one picked at random
 - `sounds/cheer.wav` + `partyblower_l.wav`/`partyblower_r.wav` (hard-panned
-  L/R) — all three together on positive wheel outcomes (REVIVE!, +2 LVL
-  CAP, x2 CATCH, THICK WATER)
+  L/R) — all three together on positive wheel outcomes EXCEPT REVIVE!
+  (+2 LVL CAP, x2 CATCH, THICK WATER)
+- REVIVE! (wheel outcome) plays `revive1.wav` alone — no combo layered on
+  top, that got muddy
 - `sounds/tick.wav` — ratchet click fired on every segment boundary the
   spinning wheel crosses, synced to the actual live spin physics (not a
   fixed clip) — see `wheel.onTick` in `wheel.lua`
-- `sounds/danger.wav` — loops for as long as any living party mon is
-  critical (≤20% HP), only STARTS on a live HP-drop into that range (a
-  save loading with an already-low mon won't trigger it), stops the
-  instant no mon is still critical
+- `sounds/danger1.wav`, `danger2.wav` — loops for as long as any living
+  party mon is critical (≤20% HP), one track picked at random per critical
+  spell. Only STARTS on a live HP-drop into that range (a save loading
+  with an already-low mon won't trigger it). Force-stops the instant the
+  ENTIRE enemy party has no living mon left (`gen3.readEnemyParty`,
+  Emerald-only so far — checks the whole enemy team, not just one mon, so
+  a trainer's mon fainting with reserves left won't cut the music early),
+  as a fallback also stops once your own mon is no longer critical (won't
+  fire on its own if you win but stay critically low, since winning
+  doesn't heal you)
 
 `playSound(name)` auto-picks randomly among numbered variants
 (`name1.wav`, `name2.wav`, ...) if present, otherwise falls back to plain

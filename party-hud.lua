@@ -25,6 +25,9 @@ local DEBUG_LOG = os.getenv("POKEPARTY_DEBUG") -- set to a dir path to enable
 -- verified this returns in ~0ms, doesn't stall the frame callback.
 local SOUND_ENABLED = (os.getenv("POKEPARTY_SOUND") or "1") ~= "0"
 local SOUND_DIR = script.dir .. "/sounds"
+-- paplay --volume is 0-65536 (65536 = 100%). Default 80% — peaked too hot
+-- at full volume in live testing. Override with POKEPARTY_SFX_VOLUME=n (0-100).
+local SFX_VOLUME = math.floor(65536 * math.max(0, math.min(100, tonumber(os.getenv("POKEPARTY_SFX_VOLUME") or "80"))) / 100)
 
 -- if numbered variants exist (name1.wav, name2.wav, ...) picks one at
 -- random; otherwise falls back to plain name.wav. Lets an event get more
@@ -41,7 +44,7 @@ local function playSound(name)
 		variants = variants + 1
 	end
 	local file = variants > 0 and (name .. tostring(math.random(variants))) or name
-	pcall(os.execute, string.format('paplay "%s/%s.wav" >/dev/null 2>&1 &', SOUND_DIR, file))
+	pcall(os.execute, string.format('paplay --volume=%d "%s/%s.wav" >/dev/null 2>&1 &', SFX_VOLUME, SOUND_DIR, file))
 end
 
 -- our own PID as mGBA's Lua interpreter sees it: os.execute forks a shell
@@ -77,24 +80,36 @@ local dangerPlaying = false
 local function startDangerMusic()
 	if not SOUND_ENABLED or dangerPlaying then return end
 	dangerPlaying = true
+	-- pick one danger track at random for this whole critical spell (same
+	-- numbered-variant convention as playSound, but done manually here
+	-- since this loop bypasses playSound entirely)
+	local variants = 0
+	while true do
+		local f = io.open(string.format("%s/danger%d.wav", SOUND_DIR, variants + 1), "rb")
+		if not f then break end
+		f:close()
+		variants = variants + 1
+	end
+	local track = variants > 0 and ("danger" .. tostring(math.random(variants))) or "danger"
 	local watchdog = MGBA_PID and string.format(
-		'; (while kill -0 %d 2>/dev/null; do sleep 1; done; kill "$LOOPPID" 2>/dev/null; pkill -f "%s/danger.wav" 2>/dev/null) &',
-		MGBA_PID, SOUND_DIR) or ''
+		'; (while kill -0 %d 2>/dev/null; do sleep 1; done; kill "$LOOPPID" 2>/dev/null; pkill -f "%s/%s.wav" 2>/dev/null) &',
+		MGBA_PID, SOUND_DIR, track) or ''
 	pcall(os.execute, string.format(
-		'sh -c \'while true; do paplay "%s/danger.wav" >/dev/null 2>&1; done & LOOPPID=$!; echo $LOOPPID > "%s"%s\' >/dev/null 2>&1 &',
-		SOUND_DIR, DANGER_PID_FILE, watchdog))
+		'sh -c \'while true; do paplay --volume=%d "%s/%s.wav" >/dev/null 2>&1; done & LOOPPID=$!; echo $LOOPPID > "%s"%s\' >/dev/null 2>&1 &',
+		SFX_VOLUME, SOUND_DIR, track, DANGER_PID_FILE, watchdog))
 end
 local function stopDangerMusic()
 	if not dangerPlaying then return end
 	dangerPlaying = false
 	-- kill the spawner loop (stops FUTURE plays) AND the currently-playing
-	-- paplay child directly (danger.wav is ~36s — without this, whatever
-	-- instance is already mid-playback when the danger clears would keep
-	-- audibly running for up to that long after the loop itself is dead).
-	-- pkill -f matches on SOUND_DIR/danger.wav specifically, unique enough
+	-- paplay child directly (danger tracks run tens of seconds to minutes —
+	-- without this, whatever instance is already mid-playback when the
+	-- danger clears would keep audibly running long after the loop itself
+	-- is dead). pkill -f matches on SOUND_DIR/danger (prefix, catches
+	-- whichever numbered track this spell happened to pick), unique enough
 	-- not to catch anything else.
 	pcall(os.execute, string.format(
-		'kill $(cat "%s" 2>/dev/null) 2>/dev/null; pkill -f "%s/danger.wav" 2>/dev/null; rm -f "%s"',
+		'kill $(cat "%s" 2>/dev/null) 2>/dev/null; pkill -f "%s/danger" 2>/dev/null; rm -f "%s"',
 		DANGER_PID_FILE, SOUND_DIR, DANGER_PID_FILE))
 end
 
@@ -254,6 +269,7 @@ local state = {
 	stats = nil,
 	prevHP = {},      -- "personality_otId" -> hp
 	prevSpecies = {}, -- "personality_otId" -> species, for evolution detection
+	prevEnemyAlive = false, -- whether the enemy party had any living mon last tick
 	lastSig = nil,    -- redraw only when content changes
 }
 
@@ -372,6 +388,7 @@ local function detectGame()
 	state.stats = nil
 	state.prevHP = {}
 	state.prevSpecies = {}
+	state.prevEnemyAlive = false
 	state.pendingEvoCredits = 0
 	state.rawStable = nil -- {tid,caught,trainers,badges}, for the 2-tick stability gate
 	state.lastSig = nil
@@ -432,11 +449,11 @@ local function trackFaints()
 			state.ds.faints = state.ds.faints + 1
 			if state.importantSet and state.importantSet[key] then
 				state.ds.shots = state.ds.shots + 2
-				flash("IMPORTANT FAINT! 2 SHOTS!", "shot")
-				playSound("faint")
+				flash("IMPORTANT FAINT! 2 SHOTS!")
+				playSound("important")
 			else
 				state.ds.shots = state.ds.shots + 1
-				flash("FAINT! TAKE A SHOT!", "shot")
+				flash("FAINT! TAKE A SHOT!")
 				playSound("faint")
 			end
 			state.dsDirty = true
@@ -531,6 +548,29 @@ local function refresh()
 		if not dangerPlaying and justDropped then startDangerMusic() end
 	else
 		stopDangerMusic()
+	end
+	-- enemy-team-defeated detection (battle just ended in our favor):
+	-- force-stops danger music even if our own mon is still critically low
+	-- post-victory — found live that winning doesn't heal you, so the
+	-- plain "no longer critical" check above never fired after a win.
+	-- Checks the WHOLE enemy party, not just one mon — a trainer's mon
+	-- fainting with reserves left must NOT trigger this, only the
+	-- true->false transition of "does the enemy have any living mon left
+	-- at all" (correctly covers both a 1-mon wild battle and a multi-mon
+	-- trainer team the same way). gEnemyParty is a fixed EWRAM address
+	-- (verified live via memory-probe cross-reference against a real wild
+	-- Marshtomp encounter, 2026-07-04) sitting immediately after
+	-- gPlayerParty — only confirmed for Emerald so far.
+	local enemyParty = gen3.readEnemyParty(game)
+	if enemyParty then
+		local anyEnemyAlive = false
+		for _, mon in ipairs(enemyParty) do
+			if mon.hp > 0 then anyEnemyAlive = true; break end
+		end
+		if state.prevEnemyAlive and not anyEnemyAlive then
+			stopDangerMusic()
+		end
+		state.prevEnemyAlive = anyEnemyAlive
 	end
 	-- must run every refresh (not gated behind saveReady) so prevSpecies
 	-- stays in sync and the first tick after a save loads doesn't get
@@ -1125,11 +1165,16 @@ local function onFrame()
 			state.dsDirty = true
 		end
 		flash(msg)
-		if seg.good then
-			-- all three fire independently (paplay spawns are fire-and-
-			-- forget), PulseAudio mixes concurrent streams on its own —
-			-- the two blowers are hard-panned L/R (see sounds/), so this
-			-- plays as one in each ear alongside the centered cheer
+		if seg.revive then
+			-- REVIVE! gets its own sound alone, not layered with the
+			-- celebration combo below (that got muddy — too many things
+			-- at once for a single outcome)
+			playSound("revive")
+		elseif seg.good then
+			-- all fire independently (paplay spawns are fire-and-forget),
+			-- PulseAudio mixes concurrent streams on its own — the two
+			-- blowers are hard-panned L/R (see sounds/), so this plays as
+			-- one in each ear alongside the centered cheer
 			playSound("cheer")
 			playSound("partyblower_l")
 			playSound("partyblower_r")
@@ -1218,10 +1263,10 @@ callbacks:add("key", function(ev)
 			flash("SHOT -1 (MANUAL)", "shot")
 		elseif k == KEY_REVIVE_UP then
 			ds.revives = ds.revives + 1
-			flash("REVIVE +1 (MANUAL)", "drink")
+			flash("REVIVE +1 (MANUAL)", "revive")
 		elseif k == KEY_REVIVE_DOWN then
 			ds.revives = math.max(0, ds.revives - 1)
-			flash("REVIVE -1 (MANUAL)", "drink")
+			flash("REVIVE -1 (MANUAL)", "revive")
 		end
 		state.dsDirty = true
 	end

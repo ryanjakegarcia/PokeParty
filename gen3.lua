@@ -44,6 +44,11 @@ local GAMES = {
 		flagsOfs = 0x1270, badgeFlag = 0x867,
 		bagOfs = 0x560, bagSlots = 30, secKeyOfs = 0xAC,
 		trainerFlag = 0x500, trainerCount = 864,
+		-- gEnemyParty: fixed EWRAM global immediately after gPlayerParty
+		-- (party + 6*100 bytes), verified live against a real wild battle
+		-- (2026-07-04) via memory-probe cross-reference — not from any
+		-- pret source offset table. Only verified for Emerald so far.
+		enemyParty = 0x020244EC + 6 * 100,
 	},
 	BPRE = {
 		name = "FireRed", party = 0x02024284, partyCount = 0x02024029,
@@ -945,6 +950,31 @@ local function decodeMon(raw)
 		nickname = nickname, species = species, isEgg = isEgg,
 		level = level, hp = hp, maxHP = maxHP, cond = cond,
 	}
+end
+
+-- reads the WHOLE enemy party (gEnemyParty, up to 6 slots) — only
+-- populated meaningfully during an actual battle; between battles it
+-- either zeros out or retains stale data from the last fight, so callers
+-- must track HP transitions (like trackFaints() does for the player's own
+-- party) rather than trusting a single snapshot read. Deliberately checks
+-- ALL slots rather than just the active battler: a trainer's mon fainting
+-- with reserves left must NOT read as "battle over" — only when every
+-- slot is empty-or-fainted is the enemy side actually defeated. No known
+-- enemyPartyCount address, so this relies on decodeMon's own personality/
+-- otId==0 rejection to treat empty slots as no-ops rather than needing a
+-- separate count. nil if this game's enemyParty address isn't known/
+-- verified yet.
+function gen3.readEnemyParty(game)
+	if not game.enemyParty then return nil end
+	local mons = {}
+	for i = 0, 5 do
+		local ok, raw = pcall(function() return emu:readRange(game.enemyParty + i * 100, 100) end)
+		if ok and raw and #raw == 100 then
+			local mon = decodeMon(raw)
+			if mon then mons[#mons + 1] = mon end
+		end
+	end
+	return mons
 end
 
 function gen3.readParty(game)
