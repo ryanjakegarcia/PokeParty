@@ -19,13 +19,16 @@ wheel.log = function(msg) console:log("PokéParty: " .. msg) end
 -- `catch` is EXTRA charges granted on top of the normal nuzlocke 1-per-route
 -- catch (so catch=1 is what "x2 CATCH" means: 2 total, 1 bonus) — not a
 -- multiplier, party-hud.lua adds it directly to state.ds.extraCatch.
+-- `good = true` marks a segment as a positive outcome (party-hud.lua plays
+-- a celebration sound combo on landing); everything else is neutral/
+-- punishment and gets no result sound for now.
 wheel.SEGMENTS = {
 	{ label = "SHOT!",          color = 0xFFE5484D, shots  = 1 },
-	{ label = "REVIVE!", 		color = 0xFF41C463, revive = 1 },
+	{ label = "REVIVE!", 		color = 0xFF41C463, revive = 1, good = true },
 	{ label = "DRINK\nx2",      color = 0xFFF5C542, drinks = 2 },
-	{ label = "+2 LVL\nCAP",    color = 0xFF6890F0, cap    = 2 },
-	{ label = "x2 CATCH", 		color = 0xFFF08030, catch  = 1 },
-	{ label = "THICK\nWATER",   color = 0xFF7C2E8C },
+	{ label = "+2 LVL\nCAP",    color = 0xFF6890F0, cap    = 2, good = true },
+	{ label = "x2 CATCH", 		color = 0xFFF08030, catch  = 1, good = true },
+	{ label = "THICK\nWATER",   color = 0xFF7C2E8C, good = true },
 	{ label = "FINISH\nDRINK",  color = 0xFFA8B820, drinks = 1 },
 	{ label = "KILL ★",      	color = 0xFF6BC7E0, drinks = 1 },
 }
@@ -193,6 +196,7 @@ function wheel.spin()
 	state.angle = math.random() * 2 * math.pi
 	state.vel = 0.45 + math.random() * 0.25
 	state.result = nil
+	state.prevSegIdx = nil
 end
 
 -- call every frame; returns the landed segment table exactly once
@@ -223,6 +227,25 @@ function wheel.tick()
 		state.angle = (state.angle + state.vel) % (2 * math.pi)
 		local perTickDecay = DECAY_PER_SECOND ^ (1 / state.measuredRate)
 		state.vel = state.vel * perTickDecay
+		-- ratchet tick: fire whenever the wheel crosses a segment boundary,
+		-- driven by the actual live angle/velocity (same physics the visual
+		-- draw uses), not a separately-authored audio clip guessing the
+		-- timing — this is what makes it track the real deceleration curve.
+		-- At peak speed the wheel can cross more than one segment per tick,
+		-- which would fire a burst of paplay spawns fast enough to overlap
+		-- and garble — cap the audible rate (reusing the same self-
+		-- calibrated measuredRate the decay math already depends on) rather
+		-- than trying to fire one sound per crossing. 20/sec still garbled
+		-- in live testing; dropped to 10/sec.
+		local n = #wheel.SEGMENTS
+		local segIdx = math.floor(state.angle / (2 * math.pi) * n) % n
+		local minGap = math.max(1, math.floor(state.measuredRate / 10))
+		if state.prevSegIdx and segIdx ~= state.prevSegIdx and wheel.onTick
+				and state.frame - (state.lastTickFrame or -1e9) >= minGap then
+			wheel.onTick()
+			state.lastTickFrame = state.frame
+		end
+		state.prevSegIdx = segIdx
 		if state.frame % 2 == 0 then draw() end
 		if state.vel < 0.006 then
 			local n = #wheel.SEGMENTS

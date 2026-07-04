@@ -17,6 +17,87 @@ local wheel = dofile(script.dir .. "/wheel.lua")
 local FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf"
 local DEBUG_LOG = os.getenv("POKEPARTY_DEBUG") -- set to a dir path to enable
 
+-- audio cues: mGBA's scripting API has no audio hooks at all (checked —
+-- console/storage/image/socket/input/stdlib/canvas is the complete list of
+-- script modules), but the full stdlib IS loaded (luaL_openlibs), so
+-- os.execute/io.popen work same as vanilla Lua. Shell out to paplay
+-- instead, backgrounded (trailing &) so the shell returns immediately —
+-- verified this returns in ~0ms, doesn't stall the frame callback.
+local SOUND_ENABLED = (os.getenv("POKEPARTY_SOUND") or "1") ~= "0"
+local SOUND_DIR = script.dir .. "/sounds"
+
+-- if numbered variants exist (name1.wav, name2.wav, ...) picks one at
+-- random; otherwise falls back to plain name.wav. Lets an event get more
+-- takes later just by dropping in more numbered files — no call-site
+-- changes needed. Cost is a few io.open probes per event, only happens on
+-- actual gameplay events (not per-frame), negligible.
+local function playSound(name)
+	if not SOUND_ENABLED then return end
+	local variants = 0
+	while true do
+		local f = io.open(string.format("%s/%s%d.wav", SOUND_DIR, name, variants + 1), "rb")
+		if not f then break end
+		f:close()
+		variants = variants + 1
+	end
+	local file = variants > 0 and (name .. tostring(math.random(variants))) or name
+	pcall(os.execute, string.format('paplay "%s/%s.wav" >/dev/null 2>&1 &', SOUND_DIR, file))
+end
+
+-- our own PID as mGBA's Lua interpreter sees it: os.execute forks a shell
+-- DIRECTLY off the mgba-qt process, so that shell's $PPID at the moment of
+-- spawn is mgba-qt's own PID. Captured once, used as a watchdog target
+-- below — this is what lets the background loop notice mGBA closing at
+-- all, since (see startDangerMusic) mGBA's scripting "stop" callback maps
+-- to the GBA's hardware STOP *CPU instruction*, not the application
+-- quitting — there's no script-level "app is closing" hook to rely on.
+local MGBA_PID
+pcall(function()
+	os.execute("echo $PPID > /tmp/pokeparty_mgba_pid.txt")
+	local f = io.open("/tmp/pokeparty_mgba_pid.txt", "r")
+	if f then
+		MGBA_PID = tonumber(f:read("*l"))
+		f:close()
+	end
+end)
+
+-- low-HP danger music: needs to LOOP for as long as a mon stays critical
+-- and be stoppable the moment it isn't — paplay alone is fire-and-forget
+-- with no handle back to it, so this backgrounds a small shell loop instead
+-- and captures its PID (via $!) to a file, which stopDangerMusic() kills.
+-- ALSO runs a watchdog in the same backgrounded shell that polls once a
+-- second whether mGBA (MGBA_PID) is still alive, killing the loop and any
+-- in-flight paplay the moment it isn't — found live that closing mGBA
+-- didn't stop the music otherwise, since nothing was watching for that at
+-- all (see MGBA_PID comment above). Bounded to ~1s worst-case latency
+-- instead of however long the current danger.wav playthrough (~36s) had
+-- left.
+local DANGER_PID_FILE = "/tmp/pokeparty_danger.pid"
+local dangerPlaying = false
+local function startDangerMusic()
+	if not SOUND_ENABLED or dangerPlaying then return end
+	dangerPlaying = true
+	local watchdog = MGBA_PID and string.format(
+		'; (while kill -0 %d 2>/dev/null; do sleep 1; done; kill "$LOOPPID" 2>/dev/null; pkill -f "%s/danger.wav" 2>/dev/null) &',
+		MGBA_PID, SOUND_DIR) or ''
+	pcall(os.execute, string.format(
+		'sh -c \'while true; do paplay "%s/danger.wav" >/dev/null 2>&1; done & LOOPPID=$!; echo $LOOPPID > "%s"%s\' >/dev/null 2>&1 &',
+		SOUND_DIR, DANGER_PID_FILE, watchdog))
+end
+local function stopDangerMusic()
+	if not dangerPlaying then return end
+	dangerPlaying = false
+	-- kill the spawner loop (stops FUTURE plays) AND the currently-playing
+	-- paplay child directly (danger.wav is ~36s — without this, whatever
+	-- instance is already mid-playback when the danger clears would keep
+	-- audibly running for up to that long after the loop itself is dead).
+	-- pkill -f matches on SOUND_DIR/danger.wav specifically, unique enough
+	-- not to catch anything else.
+	pcall(os.execute, string.format(
+		'kill $(cat "%s" 2>/dev/null) 2>/dev/null; pkill -f "%s/danger.wav" 2>/dev/null; rm -f "%s"',
+		DANGER_PID_FILE, SOUND_DIR, DANGER_PID_FILE))
+end
+
 -- cheats: pressing the hotkey tops the items pocket up to this many Rare
 -- Candies (0 = disable). Override with POKEPARTY_CANDY=n.
 local CHEAT_RARE_CANDIES = tonumber(os.getenv("POKEPARTY_CANDY") or "99")
@@ -52,6 +133,7 @@ local function log(msg)
 	end
 end
 wheel.log = log -- route wheel.lua's own log lines through the same file
+wheel.onTick = function() playSound("tick") end -- ratchet click on each segment crossing
 
 -- Canvas coordinates are GBA screen pixels (240x160); the canvas grows to
 -- fit layers, and mGBA scales the whole canvas to the window. The side
@@ -301,6 +383,7 @@ local function detectGame()
 	state.badgeIcons = {} -- badge index -> mask image (strong refs, cacheable)
 	state.badgesReady = false
 	state.badgesTried = false
+	stopDangerMusic() -- don't let a loop from the previous game/ROM linger
 	state.ds = nil          -- {drinks, shots, levelCapDelta, extraCatch, caught, trainers, badges, faints, important}
 	state.dsCommitted = nil -- last values written to disk; rollback target
 	state.dsDirty = false
@@ -317,9 +400,10 @@ local function detectGame()
 	end
 end
 
-local function flash(msg)
+local function flash(msg, sound)
 	state.flash = { text = msg, expiresAt = os.time() + FLASH_HOLD_SECONDS }
 	state.lastSig = nil -- force redraw
+	if sound then playSound(sound) end
 end
 
 local function toggleImportant()
@@ -348,10 +432,12 @@ local function trackFaints()
 			state.ds.faints = state.ds.faints + 1
 			if state.importantSet and state.importantSet[key] then
 				state.ds.shots = state.ds.shots + 2
-				flash("IMPORTANT FAINT! 2 SHOTS!")
+				flash("IMPORTANT FAINT! 2 SHOTS!", "shot")
+				playSound("faint")
 			else
 				state.ds.shots = state.ds.shots + 1
-				flash("FAINT! TAKE A SHOT!")
+				flash("FAINT! TAKE A SHOT!", "shot")
+				playSound("faint")
 			end
 			state.dsDirty = true
 		end
@@ -415,6 +501,37 @@ local function refresh()
 			or "badge graphics not found — falling back to plain squares")
 	end
 	state.party = gen3.readParty(game)
+	-- low-HP danger music: found live that a static "is anyone currently
+	-- critical" check fires even outside battle — e.g. loading a save
+	-- where a mon was already low blares it on the title/loading screen.
+	-- No reliably-verified in-battle RAM flag to gate on instead (Gen3's
+	-- gMain.inBattle bit exists in every version per pret source, but its
+	-- base address varies per game and I have no way to confirm one live
+	-- without triggering a real battle), so this only STARTS the music on
+	-- a live HP-drop into the critical range — reusing state.prevHP, the
+	-- same per-mon tracking trackFaints() already relies on (proven
+	-- reliable all session), read here BEFORE trackFaints() overwrites it
+	-- later this same tick. A fresh save load has no prior-tick HP to
+	-- compare against, so an already-low mon on load never triggers a
+	-- start; once already playing it keeps going as normal (see
+	-- stillCritical below) regardless of whether HP is still actively
+	-- dropping tick to tick.
+	local stillCritical, justDropped = false, false
+	for _, mon in ipairs(state.party) do
+		if mon.hp > 0 and mon.maxHP > 0 and (mon.hp / mon.maxHP) <= 0.2 then
+			stillCritical = true
+			local key = mon.personality .. "_" .. mon.otId
+			local prev = state.prevHP[key]
+			if prev and prev > mon.hp then
+				justDropped = true
+			end
+		end
+	end
+	if stillCritical then
+		if not dangerPlaying and justDropped then startDangerMusic() end
+	else
+		stopDangerMusic()
+	end
 	-- must run every refresh (not gated behind saveReady) so prevSpecies
 	-- stays in sync and the first tick after a save loads doesn't get
 	-- misread as a pile of simultaneous "evolutions"
@@ -542,9 +659,9 @@ local function refresh()
 					if ds.extraCatch > 0 then
 						local used = math.min(realCatches, ds.extraCatch)
 						ds.extraCatch = ds.extraCatch - used
-						flash("CAUGHT! DRINK! (x2 catch used)")
+						flash("CAUGHT! DRINK! (x2 catch used)", "drink")
 					else
-						flash("CAUGHT! DRINK!")
+						flash("CAUGHT! DRINK!", "drink")
 					end
 				end
 			end
@@ -567,14 +684,14 @@ local function refresh()
 				local drinkCount = isBoss and (n - 1) or n
 				if drinkCount > 0 then
 					ds.drinks = ds.drinks + drinkCount
-					flash("TRAINER DOWN! DRINK!")
+					flash("TRAINER DOWN! DRINK!", "drink")
 				end
 				-- gym leaders get their shot from the badges-diff check
 				-- below (badges only increment for gyms) — E4 members grant
 				-- no badge, so their shot has to be added right here
 				if isBoss and stageKey:match("^e4") then
 					ds.shots = ds.shots + 1
-					flash("ELITE FOUR MEMBER DOWN! SHOT!")
+					flash("ELITE FOUR MEMBER DOWN! SHOT!", "shot")
 				end
 				state.dsDirty = true
 			end
@@ -582,7 +699,7 @@ local function refresh()
 				local n = state.stats.badges - ds.badges
 				ds.shots = ds.shots + n
 				ds.badges = state.stats.badges
-				flash("GYM BEATEN! SHOT + WHEEL!")
+				flash("GYM BEATEN! SHOT + WHEEL!", "badge")
 				state.dsDirty = true
 				wheel.spin()
 			end
@@ -1008,6 +1125,17 @@ local function onFrame()
 			state.dsDirty = true
 		end
 		flash(msg)
+		if seg.good then
+			-- all three fire independently (paplay spawns are fire-and-
+			-- forget), PulseAudio mixes concurrent streams on its own —
+			-- the two blowers are hard-panned L/R (see sounds/), so this
+			-- plays as one in each ear alongside the centered cheer
+			playSound("cheer")
+			playSound("partyblower_l")
+			playSound("partyblower_r")
+		else
+			playSound("badwheel")
+		end
 		log(msg)
 	end
 	if state.frame % 20 ~= 0 then return end
@@ -1051,6 +1179,7 @@ callbacks:add("stop", function()
 	pcall(commitDS) -- best-effort: catch a save that landed just before close
 	state.game = nil
 	state.lastSig = nil
+	pcall(stopDangerMusic) -- don't leave the background loop running after mGBA closes
 end)
 
 -- cheat hotkeys: keyboard (default "c") and optional gamepad button.
@@ -1066,7 +1195,7 @@ callbacks:add("key", function(ev)
 	elseif k == KEY_RIVAL and state.ds then
 		state.ds.shots = state.ds.shots + 1
 		state.dsDirty = true
-		flash("RIVAL BEATEN! SHOT!")
+		flash("RIVAL BEATEN! SHOT!", "shot")
 	elseif k == KEY_IMPORTANT then
 		pcall(toggleImportant)
 	elseif k == KEY_WHEEL then
@@ -1077,22 +1206,22 @@ callbacks:add("key", function(ev)
 		local ds = state.ds
 		if k == KEY_DRINK_UP then
 			ds.drinks = ds.drinks + 1
-			flash("DRINK +1 (MANUAL)")
+			flash("DRINK +1 (MANUAL)", "drink")
 		elseif k == KEY_DRINK_DOWN then
 			ds.drinks = math.max(0, ds.drinks - 1)
-			flash("DRINK -1 (MANUAL)")
+			flash("DRINK -1 (MANUAL)", "drink")
 		elseif k == KEY_SHOT_UP then
 			ds.shots = ds.shots + 1
-			flash("SHOT +1 (MANUAL)")
+			flash("SHOT +1 (MANUAL)", "shot")
 		elseif k == KEY_SHOT_DOWN then
 			ds.shots = math.max(0, ds.shots - 1)
-			flash("SHOT -1 (MANUAL)")
+			flash("SHOT -1 (MANUAL)", "shot")
 		elseif k == KEY_REVIVE_UP then
 			ds.revives = ds.revives + 1
-			flash("REVIVE +1 (MANUAL)")
+			flash("REVIVE +1 (MANUAL)", "drink")
 		elseif k == KEY_REVIVE_DOWN then
 			ds.revives = math.max(0, ds.revives - 1)
-			flash("REVIVE -1 (MANUAL)")
+			flash("REVIVE -1 (MANUAL)", "drink")
 		end
 		state.dsDirty = true
 	end

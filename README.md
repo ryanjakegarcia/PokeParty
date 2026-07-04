@@ -90,6 +90,37 @@ spinning arrow, decaying spin (~4s), result banner for 5s. Edit
 `drinks=`/`shots=` fields feed the counters when landed. Save-state
 rewinds resync counters instead of double-counting.
 
+## Sound (experimental branch)
+
+Events play a short audio cue via `paplay`, backgrounded so it can't stall
+the emulator — mGBA's scripting API has no audio hooks of its own.
+
+- `sounds/shot.wav` — SHOT events
+- `sounds/drink1.wav`, `drink2.wav` — DRINK events, one picked at random
+- `sounds/revive1.wav`, `revive2.wav` — REVIVE events, one picked at random
+- `sounds/faint1.wav`, `faint2.wav` — faints, one picked at random, plays
+  alongside the usual shot cue
+- `sounds/badwheel.wav` — non-positive wheel outcomes (SHOT!, DRINK x2,
+  FINISH DRINK, KILL ★)
+- `sounds/cheer.wav` + `partyblower_l.wav`/`partyblower_r.wav` (hard-panned
+  L/R) — all three together on positive wheel outcomes (REVIVE!, +2 LVL
+  CAP, x2 CATCH, THICK WATER)
+- `sounds/tick.wav` — ratchet click fired on every segment boundary the
+  spinning wheel crosses, synced to the actual live spin physics (not a
+  fixed clip) — see `wheel.onTick` in `wheel.lua`
+- `sounds/danger.wav` — loops for as long as any living party mon is
+  critical (≤20% HP), only STARTS on a live HP-drop into that range (a
+  save loading with an already-low mon won't trigger it), stops the
+  instant no mon is still critical
+
+`playSound(name)` auto-picks randomly among numbered variants
+(`name1.wav`, `name2.wav`, ...) if present, otherwise falls back to plain
+`name.wav` — adding more takes to any event is just dropping in more
+numbered files, no code changes needed.
+
+- `POKEPARTY_SOUND=0` — disable sound entirely
+- Requires `paplay` (PulseAudio/PipeWire) on PATH; silently no-ops if missing
+
 ## Cheats
 
 Press **C** to top the items pocket up to 99 Rare Candies. The button strip
