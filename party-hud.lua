@@ -333,8 +333,20 @@ local function flash(msg, sound)
 	if sound then audio.playSound(sound) end
 end
 
+-- true if this mon should currently count as ★important: either manually
+-- marked (persisted, via the I hotkey), or — only when NOTHING is
+-- manually marked — the auto-selected mon (active battler in combat,
+-- lead otherwise; see state.autoImportantKey in refresh()).
+local function isImportant(key)
+	if state.importantSet and state.importantSet[key] then return true end
+	return key == state.autoImportantKey
+end
+
 local function toggleImportant()
-	local mon = state.party[1]
+	-- targets the active battler while in combat (so marking follows
+	-- whoever's actually fighting), falling back to the lead party member
+	-- outside combat — per user spec
+	local mon = (state.activeBattlerIdx and state.party[state.activeBattlerIdx + 1]) or state.party[1]
 	if not mon or not state.importantSet or not state.ds then return end
 	local key = mon.personality .. "_" .. mon.otId
 	local name = mon.nickname ~= "" and mon.nickname or mon.speciesName
@@ -357,7 +369,7 @@ local function trackFaints()
 		local prev = state.prevHP[key]
 		if prev and prev > 0 and mon.hp == 0 and state.ds then
 			state.ds.faints = state.ds.faints + 1
-			if state.importantSet and state.importantSet[key] then
+			if isImportant(key) then
 				state.ds.shots = state.ds.shots + 2
 				flash("IMPORTANT FAINT! 2 SHOTS!")
 				-- no longer plays the "important" sound here — moved to
@@ -452,6 +464,27 @@ local function refresh()
 			if mon.hp > 0 then anyEnemyAlive = true; break end
 		end
 	end
+	-- active battler's party slot (0-5), only trusted while actually in
+	-- combat — outside battle this address can hold a stale value from
+	-- the last fight (same risk class as gEnemyParty). See
+	-- gen3.activeBattlerAddr for how this was found and its caveats
+	-- (verified live on this specific randomizer ROM only).
+	state.activeBattlerIdx = (combatKnown and anyEnemyAlive) and gen3.readActiveBattlerIndex(game) or nil
+	-- ★important auto-selection: if nothing has been manually marked (via
+	-- the I hotkey), auto-treat the active battler as important while in
+	-- combat, falling back to the lead party member otherwise — per user
+	-- spec: "if we dont have any important pokemon marked then it should
+	-- auto mark the active battler", so a freshly-sent-out replacement
+	-- automatically inherits importance after the last one faints,
+	-- without needing a manual re-toggle. Only auto-applies when nothing
+	-- is manually marked — a manual mark always wins once one exists.
+	state.autoImportantKey = nil
+	if state.importantSet and not next(state.importantSet) then
+		local autoMon = (state.activeBattlerIdx and state.party[state.activeBattlerIdx + 1]) or state.party[1]
+		if autoMon then
+			state.autoImportantKey = autoMon.personality .. "_" .. autoMon.otId
+		end
+	end
 
 	-- low-HP danger music. Two start triggers:
 	--  1. a live HP-drop into the critical range (justDropped) — works
@@ -493,26 +526,28 @@ local function refresh()
 	if combatKnown and state.prevEnemyAlive and not anyEnemyAlive then
 		audio.stopDangerMusic()
 	end
-	-- ★important-mon battle-entry cue: moved here from the faint handler
-	-- per user feedback ("should play when they enter battle, not when
-	-- they die"). Fires once on the combat rising edge (not currently in
-	-- combat -> now is) if a marked-important mon is alive on the team at
-	-- that moment. Approximation, not a precise "this exact mon was just
-	-- sent out" check — we don't have active-battler-slot detection (same
-	-- limitation as the low-HP-entered-combat trigger above) — but a
-	-- fight starting with your important mon on the team is the common
-	-- case this is meant to cover.
-	if combatKnown and anyEnemyAlive and not state.prevEnemyAlive and state.importantSet then
-		for _, mon in ipairs(state.party) do
-			if mon.hp > 0 then
-				local key = mon.personality .. "_" .. mon.otId
-				if state.importantSet[key] then
-					audio.playSound("important")
-					break
-				end
-			end
-		end
-	end
+	-- ★important-mon battle-entry cue: SILOED/DISABLED (2026-07-04). Tried
+	-- driving this off state.activeBattlerIdx (fire when the active
+	-- battler changes to an important mon), but that byte also changes
+	-- from merely opening the party menu to browse without confirming a
+	-- swap — real false-positive source, and even on a genuine switch the
+	-- timing read as too early relative to the actual throw animation.
+	-- Needs a true "confirmed switch/animation playing" signal (see
+	-- gen3.lua's activeBattlerAddr comment — ballThrowCaseId/
+	-- introAnimActive in pret's BattleAnimationInfo was the lead, reached
+	-- via a gBattleSpritesDataPtr pointer chain, not chased down yet) —
+	-- shelved as not worth the effort right now. Active-battler detection
+	-- itself is fine and still used for ★ auto-marking/icon/shot-penalty
+	-- above; only this specific sound cue is disabled.
+	-- local activeBattlerKey = nil
+	-- if state.activeBattlerIdx then
+	-- 	local activeMon = state.party[state.activeBattlerIdx + 1]
+	-- 	if activeMon then activeBattlerKey = activeMon.personality .. "_" .. activeMon.otId end
+	-- end
+	-- if activeBattlerKey and activeBattlerKey ~= state.prevActiveBattlerKey and isImportant(activeBattlerKey) then
+	-- 	audio.playSound("important")
+	-- end
+	-- state.prevActiveBattlerKey = activeBattlerKey
 	state.prevEnemyAlive = anyEnemyAlive
 	-- must run every refresh (not gated behind saveReady) so prevSpecies
 	-- stays in sync and the first tick after a save loads doesn't get
@@ -790,7 +825,7 @@ local function drawMonRow(p, x, y, w, mon)
 
 	local name = mon.nickname ~= "" and mon.nickname or mon.speciesName
 	local impKey = mon.personality .. "_" .. mon.otId
-	if state.importantSet and state.importantSet[impKey] then
+	if isImportant(impKey) then
 		name = "★" .. name
 	end
 

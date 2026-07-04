@@ -63,6 +63,17 @@ local GAMES = {
 		-- (2026-07-04) via memory-probe cross-reference — not from any
 		-- pret source offset table. Only verified for Emerald so far.
 		enemyParty = 0x020244EC + 6 * 100,
+		-- Active battler's party slot index (0-5), single byte. Found
+		-- live (2026-07-04) by scanning for a byte that tracked real
+		-- mid-battle mon switches (BIG->SALAD->MAY2, matching each one's
+		-- known party index exactly, 2/2 clean). NOT derived from pret's
+		-- BattleStruct.battlerPartyIndexes — hand-computing that offset
+		-- from source gave a value that was consistently off (this ROM is
+		-- a randomizer hack, UPR ZX, whose compiled struct layout likely
+		-- differs from vanilla pret source). Only verified on this
+		-- specific ROM/build so far — could need reverification on a
+		-- vanilla Emerald ROM or a different randomizer seed/hack.
+		activeBattlerAddr = 0x02000091,
 	},
 	BPRE = {
 		name = "FireRed", party = 0x02024284, partyCount = 0x02024029,
@@ -1068,6 +1079,14 @@ function gen3.readEnemyParty(game)
 		end
 	end
 	return mons
+end
+
+function gen3.readActiveBattlerIndex(game)
+	if not game.activeBattlerAddr then return nil end
+	local ok, byte = pcall(function() return emu:read8(game.activeBattlerAddr) end)
+	if not ok then logPcallFailure("readActiveBattlerIndex: active battler byte read", byte) end
+	if not ok or not byte or byte > 5 then return nil end
+	return byte
 end
 
 function gen3.readParty(game)
