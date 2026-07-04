@@ -299,6 +299,7 @@ local function detectGame()
 	state.prevHP = {}
 	state.prevSpecies = {}
 	state.prevEnemyAlive = false
+	state.prevAnyPartyAlive = false
 	state.pendingEvoCredits = 0
 	state.rawStable = nil -- {tid,caught,trainers,badges}, for the 2-tick stability gate
 	state.lastSig = nil
@@ -441,6 +442,24 @@ local function refresh()
 			or "badge graphics not found — falling back to plain squares")
 	end
 	state.party = gen3.readParty(game)
+
+	-- white-out/black-out (lose a battle — every party mon fainted at
+	-- once): only evaluated on a genuinely non-empty party read, so a
+	-- transient bad read (party briefly empty) can't fake a false
+	-- true->false transition — same guard reasoning as trackFaints() etc.
+	-- Can only physically happen mid-battle (no other way for every mon
+	-- to hit 0 HP simultaneously), so no combat gate needed unlike danger
+	-- music.
+	if #state.party > 0 then
+		local anyPartyAlive = false
+		for _, mon in ipairs(state.party) do
+			if mon.hp > 0 then anyPartyAlive = true; break end
+		end
+		if state.prevAnyPartyAlive and not anyPartyAlive then
+			flash("WHITE OUT!", "whiteout")
+		end
+		state.prevAnyPartyAlive = anyPartyAlive
+	end
 
 	-- gEnemyParty read first — used both as the "battle just ended" signal
 	-- (below) and, new, as a combat gate for danger music: whether the

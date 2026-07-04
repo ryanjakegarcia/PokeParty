@@ -107,6 +107,8 @@ the emulator — mGBA's scripting API has no audio hooks of its own.
 - `sounds/revive1.wav` — REVIVE events
 - `sounds/faint1.wav` .. `faint5.wav` — regular faints, one picked at
   random
+- `sounds/whiteout.wav` — white out / black out (every party mon fainted
+  at once, battle lost)
 - `sounds/important1.wav` .. `important4.wav` — currently unwired, not
   played on anything. Was tried as a battle-entry cue (fire when a marked
   ★important mon becomes the active battler) but that signal proved

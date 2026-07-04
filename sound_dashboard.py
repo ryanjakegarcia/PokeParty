@@ -16,6 +16,7 @@ EVENTS = [
     ("DRINK", ["drink1.wav", "drink2.wav", "drink3.wav"]),
     ("REVIVE", ["revive1.wav"]),
     ("FAINT", ["faint1.wav", "faint2.wav", "faint3.wav", "faint4.wav", "faint5.wav"]),
+    ("WHITE OUT (lose battle)", ["whiteout.wav"]),
     ("UNWIRED (not currently played anywhere)", ["important1.wav", "important2.wav", "important3.wav", "important4.wav"]),
     ("GYM BEATEN", ["badge.wav"]),
     ("WHEEL: bad outcome", ["badwheel1.wav", "badwheel2.wav", "badwheel3.wav", "badwheel4.wav"]),
