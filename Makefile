@@ -16,7 +16,7 @@ CONFIG_DIR := $(HOME)/.config/mgba
 
 DEPS := qt6-base-dev qt6-multimedia-dev libsdl2-dev liblua5.4-dev \
         libelf-dev libepoxy-dev libsqlite3-dev libzip-dev libpng-dev \
-        libjson-c-dev cmake ninja-build git
+        libjson-c-dev cmake ninja-build git pulseaudio-utils
 
 .PHONY: help setup deps mgba-clone mgba-patch mgba-build config run clean
 
