@@ -58,11 +58,13 @@ local state = {
 	ticksThisSec = 0,
 	measuredRate = 60, -- ticks/sec, updated continuously; 60 = 1x default
 }
--- decay tuned at the original 60-ticks/sec baseline (0.985/tick), expressed
--- as "how much velocity survives after one real second" (≈0.404) —
--- reapplied at whatever rate ticks actually happen at, so total decay per
--- real second stays constant regardless of tick rate.
-local DECAY_PER_SECOND = 0.985 ^ 60
+-- "how much velocity survives after one real second" — reapplied at
+-- whatever rate ticks actually happen at, so total decay per real second
+-- stays constant regardless of tick rate. 0.544 gives a ~7.5s spin (was
+-- 0.404 / ~5s — user feedback: tick sound needed more time to read as
+-- synced with the visual deceleration, prolonging the spin gives the ear
+-- more of the curve to follow).
+local DECAY_PER_SECOND = 0.544
 
 local function px(v) return math.floor(v * S) end
 

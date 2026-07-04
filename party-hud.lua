@@ -180,6 +180,7 @@ local state = {
 	topLayer = nil,
 	bottomLayer = nil,
 	frame = 0,
+	volumeShownUntil = 0, -- os.time()-based; volume bar display window, not per-game
 }
 
 local bucket = storage:getBucket("PokePartymGBA")
@@ -359,7 +360,8 @@ local function trackFaints()
 			if state.importantSet and state.importantSet[key] then
 				state.ds.shots = state.ds.shots + 2
 				flash("IMPORTANT FAINT! 2 SHOTS!")
-				audio.playSound("important")
+				-- no longer plays the "important" sound here — moved to
+				-- battle-entry instead (see refresh(), combat rising edge)
 			else
 				state.ds.shots = state.ds.shots + 1
 				flash("FAINT! TAKE A SHOT!")
@@ -427,21 +429,44 @@ local function refresh()
 			or "badge graphics not found — falling back to plain squares")
 	end
 	state.party = gen3.readParty(game)
-	-- low-HP danger music: found live that a static "is anyone currently
-	-- critical" check fires even outside battle — e.g. loading a save
-	-- where a mon was already low blares it on the title/loading screen.
-	-- No reliably-verified in-battle RAM flag to gate on instead (Gen3's
-	-- gMain.inBattle bit exists in every version per pret source, but its
-	-- base address varies per game and I have no way to confirm one live
-	-- without triggering a real battle), so this only STARTS the music on
-	-- a live HP-drop into the critical range — reusing state.prevHP, the
-	-- same per-mon tracking trackFaints() already relies on (proven
-	-- reliable all session), read here BEFORE trackFaints() overwrites it
-	-- later this same tick. A fresh save load has no prior-tick HP to
-	-- compare against, so an already-low mon on load never triggers a
-	-- start; once already playing it keeps going as normal (see
-	-- stillCritical below) regardless of whether HP is still actively
-	-- dropping tick to tick.
+
+	-- gEnemyParty read first — used both as the "battle just ended" signal
+	-- (below) and, new, as a combat gate for danger music: whether the
+	-- enemy currently has any living mon is the closest thing we have to
+	-- an "in battle" flag (no reliably-verified gMain.inBattle address —
+	-- see gen3.lua). Checks the WHOLE enemy party, not just one mon: a
+	-- trainer's mon fainting with reserves left must not read as "enemy
+	-- defeated." gEnemyParty is a fixed EWRAM address (verified live via
+	-- memory-probe cross-reference against real wild and multi-mon
+	-- trainer battles, 2026-07-04) sitting immediately after gPlayerParty
+	-- — only confirmed for Emerald so far; combatKnown is false on any
+	-- other game, in which case danger music falls back to the plain
+	-- HP-drop trigger below with no combat gating at all (better to risk
+	-- an overworld false-positive than never play at all on unverified
+	-- games).
+	local enemyParty = gen3.readEnemyParty(game)
+	local combatKnown = enemyParty ~= nil
+	local anyEnemyAlive = false
+	if enemyParty then
+		for _, mon in ipairs(enemyParty) do
+			if mon.hp > 0 then anyEnemyAlive = true; break end
+		end
+	end
+
+	-- low-HP danger music. Two start triggers:
+	--  1. a live HP-drop into the critical range (justDropped) — works
+	--     even without combat detection, reusing state.prevHP, the same
+	--     per-mon tracking trackFaints() already relies on, read here
+	--     BEFORE trackFaints() overwrites it later this same tick. A fresh
+	--     save load has no prior-tick HP to compare against, so an
+	--     already-low mon on load never triggers a start this way.
+	--  2. (only when combatKnown) a critical mon simply being on the
+	--     field WHILE in combat (enteredCriticalInCombat) — catches a mon
+	--     that was ALREADY critical from a previous fight getting sent out
+	--     into a NEW battle, where its HP doesn't drop this tick at all
+	--     (found live: trigger 1 alone missed this case).
+	-- Once already playing, it keeps going regardless of which trigger
+	-- fired or whether HP is still actively dropping tick to tick.
 	local stillCritical, justDropped = false, false
 	for _, mon in ipairs(state.party) do
 		if mon.hp > 0 and mon.maxHP > 0 and (mon.hp / mon.maxHP) <= 0.2 then
@@ -453,36 +478,42 @@ local function refresh()
 			end
 		end
 	end
+	local enteredCriticalInCombat = combatKnown and anyEnemyAlive and stillCritical
 	if stillCritical then
 		-- audio.startDangerMusic() already no-ops internally if a track is
 		-- already playing, so no need to gate on that state here too
-		if justDropped then audio.startDangerMusic() end
+		if justDropped or enteredCriticalInCombat then audio.startDangerMusic() end
 	else
 		audio.stopDangerMusic()
 	end
 	-- enemy-team-defeated detection (battle just ended in our favor):
 	-- force-stops danger music even if our own mon is still critically low
 	-- post-victory — found live that winning doesn't heal you, so the
-	-- plain "no longer critical" check above never fired after a win.
-	-- Checks the WHOLE enemy party, not just one mon — a trainer's mon
-	-- fainting with reserves left must NOT trigger this, only the
-	-- true->false transition of "does the enemy have any living mon left
-	-- at all" (correctly covers both a 1-mon wild battle and a multi-mon
-	-- trainer team the same way). gEnemyParty is a fixed EWRAM address
-	-- (verified live via memory-probe cross-reference against a real wild
-	-- Marshtomp encounter, 2026-07-04) sitting immediately after
-	-- gPlayerParty — only confirmed for Emerald so far.
-	local enemyParty = gen3.readEnemyParty(game)
-	if enemyParty then
-		local anyEnemyAlive = false
-		for _, mon in ipairs(enemyParty) do
-			if mon.hp > 0 then anyEnemyAlive = true; break end
-		end
-		if state.prevEnemyAlive and not anyEnemyAlive then
-			audio.stopDangerMusic()
-		end
-		state.prevEnemyAlive = anyEnemyAlive
+	-- plain "no longer critical" check above never fires after a win.
+	if combatKnown and state.prevEnemyAlive and not anyEnemyAlive then
+		audio.stopDangerMusic()
 	end
+	-- ★important-mon battle-entry cue: moved here from the faint handler
+	-- per user feedback ("should play when they enter battle, not when
+	-- they die"). Fires once on the combat rising edge (not currently in
+	-- combat -> now is) if a marked-important mon is alive on the team at
+	-- that moment. Approximation, not a precise "this exact mon was just
+	-- sent out" check — we don't have active-battler-slot detection (same
+	-- limitation as the low-HP-entered-combat trigger above) — but a
+	-- fight starting with your important mon on the team is the common
+	-- case this is meant to cover.
+	if combatKnown and anyEnemyAlive and not state.prevEnemyAlive and state.importantSet then
+		for _, mon in ipairs(state.party) do
+			if mon.hp > 0 then
+				local key = mon.personality .. "_" .. mon.otId
+				if state.importantSet[key] then
+					audio.playSound("important")
+					break
+				end
+			end
+		end
+	end
+	state.prevEnemyAlive = anyEnemyAlive
 	-- must run every refresh (not gated behind saveReady) so prevSpecies
 	-- stays in sync and the first tick after a save loads doesn't get
 	-- misread as a pile of simultaneous "evolutions"
@@ -802,6 +833,10 @@ local function drawMonRow(p, x, y, w, mon)
 	end
 end
 
+local function volumeBarActive()
+	return state.volumeShownUntil > os.time()
+end
+
 -- top strip: full-width event banner. Blank except for the ~4.5s window
 -- after something notable happens — kept simple and unmissable for a room
 -- of spectators, not crowded with anything ambient.
@@ -810,14 +845,27 @@ local function drawTopStrip()
 	local p = image.newPainter(state.topLayer.image)
 	p:loadFont(FONT_PATH)
 	p:setBlend(false)
-	local active = state.flash and state.flash.expiresAt > os.time()
+	local showingVolume = volumeBarActive()
+	local active = not showingVolume and state.flash and state.flash.expiresAt > os.time()
 	local bg = C.bg
 	if active then
 		bg = state.dsWasRegressed and C.warnBg or C.accent
 	end
 	rect(p, 0, 0, STRIP_W, STRIP_H, bg)
 	p:setBlend(true)
-	if active then
+	if showingVolume then
+		-- volume bar takes priority over a flash banner while active — a
+		-- direct scroll interaction should get immediate feedback; the
+		-- flash's own 5s hold means it'll still show shortly after this
+		-- shorter 2s window elapses
+		local pct = audio.getVolumePercent()
+		local label = "VOLUME " .. pct .. "%"
+		local barW, barH = STRIP_W - 20, 6
+		local barX, barY = 10, STRIP_H // 2 + 2
+		text(p, label, STRIP_W // 2, STRIP_H // 2 - 6, 10, C.text, VC)
+		rect(p, barX, barY, barW, barH, C.hpBack)
+		rect(p, barX, barY, math.floor(barW * pct / 100), barH, C.accent)
+	elseif active then
 		local fg = state.dsWasRegressed and 0xFFECEFF4 or 0xFF10141D
 		text(p, state.flash.text, STRIP_W // 2, STRIP_H // 2, 13, fg, VC)
 	elseif state.game then
@@ -994,6 +1042,11 @@ end
 -- signature of displayed data; redraw only on change
 local function signature()
 	local parts = { flashActive() and state.flash.text or "F0" }
+	-- include the volume-bar active state (and percent) so both showing it
+	-- and its later auto-expiry actually trigger a redraw — draw() only
+	-- runs when this signature changes, same reason flashActive() feeds in
+	-- above
+	parts[#parts + 1] = volumeBarActive() and ("V" .. audio.getVolumePercent()) or "V0"
 	if state.ds then
 		parts[#parts + 1] = state.ds.drinks
 		parts[#parts + 1] = state.ds.shots
@@ -1189,6 +1242,28 @@ callbacks:add("gamepadButton", function(ev)
 			pcall(giveCandies)
 		end
 	end
+end)
+
+-- scroll wheel adjusts SFX volume live. Found live (log-instrumented,
+-- 2026-07-04): scroll-up reports a small positive ev.y (e.g. 120) as
+-- expected, but scroll-down reports a LARGE positive value near 65536
+-- (e.g. 65416) instead of a small negative one — an unsigned 16-bit
+-- wraparound of what should be -120 (65536-120=65416, confirmed exact).
+-- ev.x doesn't have this issue (comes through properly signed). Corrected
+-- by reinterpreting anything above 32768 as its wrapped-negative value
+-- before using the sign. Shows a temporary bar in the top strip (see
+-- volumeBarActive/signature) instead of the usual game-name/flash
+-- content, auto-hiding 2s after the last scroll.
+local VOLUME_STEP = 5
+callbacks:add("mouseWheel", function(ev)
+	local dy = ev.y or 0
+	if DEBUG_LOG then log(string.format("mouseWheel ev.x=%s ev.y=%s", tostring(ev.x), tostring(ev.y))) end
+	if dy > 32768 then dy = dy - 65536 end
+	if dy == 0 then return end
+	local pct = audio.getVolumePercent() + (dy > 0 and VOLUME_STEP or -VOLUME_STEP)
+	audio.setVolumePercent(pct)
+	state.volumeShownUntil = os.time() + 2
+	state.lastSig = nil -- force an immediate redraw rather than waiting for the next signature change
 end)
 
 detectGame()

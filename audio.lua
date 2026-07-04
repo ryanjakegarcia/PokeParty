@@ -25,9 +25,24 @@ audio.log = function(msg) console:log("PokéParty: " .. msg) end
 local SOUND_DIR = nil
 
 local SOUND_ENABLED = (os.getenv("POKEPARTY_SOUND") or "1") ~= "0"
--- paplay --volume is 0-65536 (65536 = 100%). Default 80% — peaked too hot
--- at full volume in live testing. Override with POKEPARTY_SFX_VOLUME=n (0-100).
-local SFX_VOLUME = math.floor(65536 * math.max(0, math.min(100, tonumber(os.getenv("POKEPARTY_SFX_VOLUME") or "80"))) / 100)
+-- paplay --volume is 0-65536 (65536 = 100%). Default lowered to 55% after
+-- live feedback that 80% still peaked too hot. Override with
+-- POKEPARTY_SFX_VOLUME=n (0-100); live-adjustable via mouse scroll wheel
+-- (see party-hud.lua's mouseWheel callback and audio.setVolumePercent
+-- below) on top of whatever this starts at.
+local volumePercent = math.max(0, math.min(100, tonumber(os.getenv("POKEPARTY_SFX_VOLUME") or "55")))
+
+local function volumeUnits()
+	return math.floor(65536 * volumePercent / 100)
+end
+
+function audio.getVolumePercent()
+	return volumePercent
+end
+
+function audio.setVolumePercent(pct)
+	volumePercent = math.max(0, math.min(100, pct))
+end
 
 -- must be called once by the caller right after dofile(), passing the
 -- sound directory resolved in the CALLER's own scope (see SOUND_DIR
@@ -88,7 +103,7 @@ end
 function audio.playSound(name)
 	if not SOUND_ENABLED then return end
 	local file = pickVariant(name)
-	pcall(os.execute, string.format('paplay --volume=%d "%s/%s.wav" >/dev/null 2>&1 &', SFX_VOLUME, SOUND_DIR, file))
+	pcall(os.execute, string.format('paplay --volume=%d "%s/%s.wav" >/dev/null 2>&1 &', volumeUnits(), SOUND_DIR, file))
 end
 
 -- low-HP danger music: needs to LOOP for as long as a mon stays critical
@@ -122,12 +137,19 @@ function audio.startDangerMusic()
 	dangerPlaying = true
 	-- pick one danger track at random for this whole critical spell
 	local track = pickVariant("danger")
+	-- volume is baked into this shell script string at loop-start time —
+	-- scrolling to adjust volume WHILE a danger loop is already running
+	-- won't retroactively affect it (the loop just keeps re-running paplay
+	-- with whatever value it started with), only the NEXT critical spell
+	-- picks up a changed volume. Fixing that would need the loop to
+	-- re-read a live value each iteration (e.g. from a file) — more
+	-- complexity than justified today.
 	local watchdog = MGBA_PID and string.format(
 		'; (while kill -0 %d 2>/dev/null; do sleep 1; done; kill "$LOOPPID" 2>/dev/null; %s) &',
 		MGBA_PID, killMatchingExceptSelf(string.format("%s/%s.wav", SOUND_DIR, track))) or ''
 	pcall(os.execute, string.format(
 		'sh -c \'while true; do paplay --volume=%d "%s/%s.wav" >/dev/null 2>&1; done & LOOPPID=$!; echo $LOOPPID > "%s"%s\' >/dev/null 2>&1 &',
-		SFX_VOLUME, SOUND_DIR, track, DANGER_PID_FILE, watchdog))
+		volumeUnits(), SOUND_DIR, track, DANGER_PID_FILE, watchdog))
 end
 
 function audio.stopDangerMusic()
